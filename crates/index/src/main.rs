@@ -19,13 +19,16 @@ mod compare;
 mod docx;
 mod embed;
 mod store;
+mod tokens;
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
+use chunk::units::{Chars, Units};
 use chunk::{ChunkParams, Chunker};
 use docx::Document;
 use embed::{ContextOverflow, EmbedConfig, Embedder};
@@ -99,17 +102,21 @@ struct BuildArgs {
     /// Стратегия: fixed, structure или all.
     #[arg(long, default_value = "all")]
     strategy: String,
-    /// fixed: размер окна в символах.
+    /// В чём меряются размеры ниже: символы или токены модели.
+    #[arg(long, value_enum, default_value_t = Unit::Chars)]
+    unit: Unit,
+    /// fixed: размер окна в единицах --unit.
     #[arg(long, default_value_t = 1200)]
     chunk_size: usize,
-    /// fixed: перекрытие соседних окон в символах.
+    /// fixed: перекрытие соседних окон в единицах --unit.
     #[arg(long, default_value_t = 200)]
     overlap: usize,
-    /// structure: раздел длиннее режется по абзацам. Умолчание подобрано под
-    /// контекст nomic-embed-text в 2048 токенов на русском тексте.
+    /// structure: потолок чанка в единицах --unit; раздел длиннее режется по
+    /// абзацам. Умолчание в символах подобрано под контекст nomic-embed-text
+    /// в 2048 токенов на русском тексте.
     #[arg(long, default_value_t = 1500)]
     max_section: usize,
-    /// structure: раздел короче склеивается со следующим.
+    /// structure: кусок короче (в единицах --unit) склеивается с соседним.
     #[arg(long, default_value_t = 200)]
     min_section: usize,
     /// Минимальный объём корпуса в символах.
@@ -117,6 +124,14 @@ struct BuildArgs {
     min_chars: usize,
     #[command(flatten)]
     embed: EmbedArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+enum Unit {
+    /// Символы текста.
+    Chars,
+    /// Токены модели эмбеддингов (словарь берётся у Ollama).
+    Tokens,
 }
 
 #[derive(Debug, Args)]
@@ -241,16 +256,39 @@ fn chunk_rows(chunker: &dyn Chunker, docs: &[Document]) -> Vec<ChunkRow> {
     rows
 }
 
+/// Единицы размеров. В токенах заодно проверяется, что самый большой чанк
+/// вместе с префиксом задачи и служебными `[CLS]`/`[SEP]` помещается в
+/// `--num-ctx`: иначе ошибка всплыла бы только на эмбеддинге.
+async fn make_units(args: &BuildArgs) -> Result<Arc<dyn Units>> {
+    match args.unit {
+        Unit::Chars => Ok(Arc::new(Chars)),
+        Unit::Tokens => {
+            let wp = tokens::WordPiece::from_ollama(&args.embed.ollama_url, &args.embed.model)
+                .await
+                .context("словарь для --unit tokens")?;
+            let overhead = wp.count(&args.embed.doc_prefix) + 2;
+            let largest = args.chunk_size.max(args.max_section);
+            ensure!(
+                largest + overhead <= args.embed.num_ctx as usize,
+                "чанк до {largest} токенов плюс {overhead} на префикс и служебные токены не помещается в --num-ctx {}",
+                args.embed.num_ctx
+            );
+            Ok(Arc::new(tokens::TokenUnits(wp)))
+        }
+    }
+}
+
 async fn run_build(args: &BuildArgs) -> Result<Vec<BuildInfo>> {
+    let embedder = args.embed.embedder()?;
+    let units = make_units(args).await?;
     let params = ChunkParams {
         chunk_size: args.chunk_size,
         overlap: args.overlap,
         max_section: args.max_section,
         min_section: args.min_section,
+        units,
     };
-    // Стратегии и эмбеддер проверяют флаги до чтения корпуса и сети.
     let chunkers = chunk::select(&args.strategy, &params)?;
-    let embedder = args.embed.embedder()?;
     let docs = read_corpus(args)?;
     let chars: usize = docs.iter().map(Document::char_len).sum();
     let store = Store::open(&args.db).await?;
@@ -452,6 +490,7 @@ mod tests {
             (1200, 200, 1500, 200)
         );
         assert_eq!(a.min_chars, 50_000);
+        assert_eq!(a.unit, Unit::Chars);
         let e = &a.embed;
         assert_eq!(e.ollama_url, "http://localhost:11434");
         assert_eq!(e.model, "nomic-embed-text");
@@ -610,6 +649,108 @@ mod tests {
         assert!(err.contains("уменьшите --max-section"), "{err}");
     }
 
+    async fn ollama_with_vocab() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/embed"))
+            .respond_with(BagOfWords { dim: 768 })
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/show"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model_info": {
+                        "tokenizer.ggml.model": "bert",
+                        "tokenizer.ggml.tokens": tokens::testutil::vocab(),
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn sizes_in_tokens_bound_every_chunk() {
+        let server = ollama_with_vocab().await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_corpus(tmp.path());
+        let db = tmp.path().join("index.db");
+        let url = server.uri();
+        let args = build_args(&[
+            "--input",
+            tmp.path().to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--ollama-url",
+            &url,
+            "--min-chars",
+            "0",
+            "--unit",
+            "tokens",
+            "--chunk-size",
+            "60",
+            "--overlap",
+            "10",
+            "--max-section",
+            "90",
+            "--min-section",
+            "15",
+        ]);
+        let infos = run_build(&args).await.unwrap();
+        assert!(
+            infos
+                .iter()
+                .all(|i| i.params.contains(r#""unit":"tokens""#)),
+            "{infos:?}"
+        );
+        let wp = tokens::WordPiece::from_ollama(&url, "nomic-embed-text")
+            .await
+            .unwrap();
+        let store = Store::open(&db).await.unwrap();
+        let fixed = store.load("fixed").await.unwrap();
+        let structure = store.load("structure").await.unwrap();
+        for c in &fixed {
+            assert!(
+                wp.count(&c.row.text) <= 60,
+                "{}: {}",
+                c.row.chunk_id,
+                wp.count(&c.row.text)
+            );
+        }
+        for c in &structure {
+            assert!(
+                wp.count(&c.row.text) <= 90,
+                "{}: {}",
+                c.row.chunk_id,
+                wp.count(&c.row.text)
+            );
+        }
+        // Окна по 60 токенов длиннее одного токена на слово: чанков заметно больше десятка.
+        assert!(fixed.len() > 10, "{}", fixed.len());
+    }
+
+    #[tokio::test]
+    async fn token_sizes_must_fit_num_ctx() {
+        let server = ollama_with_vocab().await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_corpus(tmp.path());
+        let url = server.uri();
+        let args = build_args(&[
+            "--input",
+            tmp.path().to_str().unwrap(),
+            "--ollama-url",
+            &url,
+            "--min-chars",
+            "0",
+            "--unit",
+            "tokens",
+            "--max-section",
+            "2048",
+        ]);
+        let err = run_build(&args).await.unwrap_err().to_string();
+        assert!(err.contains("не помещается в --num-ctx 2048"), "{err}");
+    }
+
     #[tokio::test]
     async fn small_corpus_is_an_error_with_char_count() {
         let tmp = tempfile::tempdir().unwrap();
@@ -681,6 +822,7 @@ mod tests {
     async fn live_ollama_embeds_with_prefixes() {
         let url = std::env::var("INDEX_MCP_OLLAMA_URL")
             .unwrap_or_else(|_| "http://localhost:11434".into());
+        let url_for_show = url.clone();
         let e = Embedder::new(EmbedConfig {
             url,
             model: "nomic-embed-text".into(),
@@ -708,6 +850,26 @@ mod tests {
             .unwrap();
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
         assert!(dot(&q[0], &docs[0]) > dot(&q[0], &docs[1]));
+        // Наш счёт токенов сверяется со счётом самого Ollama.
+        let wp = tokens::WordPiece::from_ollama(&url_for_show, "nomic-embed-text")
+            .await
+            .unwrap();
+        let sample = "Протокол TCP устанавливает соединение, а UDP — нет. Ёмкость окна растёт.";
+        let body: serde_json::Value = reqwest::Client::new()
+            .post(format!("{url_for_show}/api/embed"))
+            .json(&serde_json::json!({ "model": "nomic-embed-text", "input": sample }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ollama = body["prompt_eval_count"].as_u64().unwrap() as usize;
+        let ours = wp.count(sample) + 2; // [CLS] и [SEP]
+        assert!(
+            ours.abs_diff(ollama) <= 2,
+            "наш счёт {ours}, Ollama {ollama}"
+        );
         // Чанк длиной в умолчание --max-section (1500 символов русского текста)
         // помещается в контекст модели в 2048 токенов.
         let long = "Раздел конспекта про сети. ".repeat(55);

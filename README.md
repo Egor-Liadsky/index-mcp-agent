@@ -25,6 +25,8 @@ Cargo workspace (Rust edition 2024) из одного крейта:
   эмбеддинги → хранилище) и команда `compare`;
 - `src/docx.rs` — абзацы `.docx` с уровнем заголовка и смещениями;
 - `src/chunk/mod.rs` — трейт `Chunker`, реестр стратегий и метрики границ;
+- `src/chunk/units.rs` — единицы длины (`Units`) и разметка `Measure`;
+- `src/tokens.rs` — счёт токенов WordPiece по словарю модели из Ollama;
 - `src/chunk/fixed.rs`, `src/chunk/structure.rs` — две стратегии;
 - `src/embed.rs` — клиент `POST /api/embed` Ollama;
 - `src/store.rs` — SQLite через `sqlx`, миграции в `migrations/`;
@@ -35,6 +37,7 @@ Cargo workspace (Rust edition 2024) из одного крейта:
 | Асинхронный рантайм  | `tokio`                        |
 | CLI                  | `clap`                         |
 | Чтение `.docx`       | `zip`, `quick-xml`             |
+| Счёт токенов         | `unicode-normalization` (NFD)  |
 | HTTP к Ollama        | `reqwest` (rustls)             |
 | Индекс               | `sqlx` (SQLite, migrate)       |
 | Сериализация, ошибки | `serde`, `serde_json`, `anyhow`|
@@ -76,7 +79,8 @@ sqlite3 index.db "select strategy, count(*) from chunks group by strategy;
 | `--input`       | —            | каталог с `.docx`, обходится рекурсивно; скрытые каталоги и lock-файлы `~$*.docx` пропускаются |
 | `--db`          | `index.db`   | файл SQLite, создаётся при первом запуске |
 | `--strategy`    | `all`        | `fixed`, `structure` или `all` |
-| `--chunk-size`  | `1200`       | `fixed`: размер окна в символах |
+| `--unit`        | `chars`      | единица размеров ниже: `chars` (символы) или `tokens` (токены модели) |
+| `--chunk-size`  | `1200`       | `fixed`: размер окна |
 | `--overlap`     | `200`        | `fixed`: перекрытие окон, меньше половины окна |
 | `--max-section` | `1500`       | `structure`: потолок длины чанка; раздел длиннее режется по абзацам |
 | `--min-section` | `200`        | `structure`: кусок короче склеивается со следующим |
@@ -104,6 +108,33 @@ sqlite3 index.db "select strategy, count(*) from chunks group by strategy;
 
 `compare` отказывается работать, если база построена другой моделью или
 размерностью, чем указаны флаги: векторы разных моделей несравнимы.
+
+## Размеры в символах или токенах
+
+`--unit` задаёт, в чём меряются `--chunk-size`, `--overlap`, `--max-section`
+и `--min-section`. Числа умолчаний одни и те же, поэтому с `--unit tokens`
+размеры обычно задают явно:
+
+```bash
+index-mcp build --input ~/notes --unit tokens --chunk-size 400 --overlap 50 \
+  --max-section 600 --min-section 60
+```
+
+- `chars` — символы текста (умолчание);
+- `tokens` — токены `nomic-embed-text`. Словарь берётся у Ollama
+  (`POST /api/show` с `verbose: true`), считается токенизатором WordPiece
+  так же, как Ollama режет вход модели. Токены — ровно то, что ограничивает
+  контекст модели, поэтому в этом режиме `build` до чтения корпуса
+  проверяет: самый большой чанк плюс префикс задачи и `[CLS]`/`[SEP]` не
+  больше `--num-ctx`;
+- размер относится к тексту чанка, включая дописанный заголовок
+  продолжения, но без префикса задачи;
+- граница разреза по-прежнему ищется у конца предложения или пробела, поэтому
+  чанк бывает немного короче заданного размера, а перекрытие — немного
+  меньше.
+
+В отчёте длины чанков — в символах, единица построения записана в
+параметрах стратегии (`"unit"`).
 
 ## Стратегии chunking
 
@@ -228,6 +259,17 @@ MRR ожидаемо невысокие. Сравнение стратегий �
 помещаются). Нативный `/api/embed` выбран вместо OpenAI-совместимого
 `/v1/embeddings` ради `truncate` и `options`.
 
+**Токенизатор внутри, а не отдельный словарь.** Счёт токенов повторяет
+WPM-токенизатор llama.cpp: NFD с удалением диакритики (`й` → `и`), нижний
+регистр, пунктуация отдельными словами, жадный поиск самых длинных токенов
+после «фантомного пробела» `▁`, слово без разбора — один `[UNK]`. Словарь
+приходит из того же Ollama, поэтому модель и счёт не расходятся, а
+скачивать `tokenizer.json` с Hugging Face не нужно. Точное совпадение с
+Ollama до токена не гарантировано (классы пунктуации Unicode взяты
+приближённо), поэтому живой тест сверяет счёт с `prompt_eval_count`
+Ollama с допуском в 2 токена, а переполнение всё равно ловит
+`truncate: false`.
+
 **Как определяются заголовки.** Не по `styleId`: в русском Word id стиля
 «Заголовок 1» — `1`, в английском — `Heading1`. Уровень берётся из
 `styles.xml`: имя стиля `heading 1`…`heading 9` (Word пишет его
@@ -254,7 +296,8 @@ cargo clippy --all-targets -- -D warnings
 слов», при котором вопросы находят свои разделы. `.docx` собираются в
 памяти, двоичных файлов в репозитории нет.
 
-Живой тест против Ollama с `nomic-embed-text`:
+Живой тест против Ollama с `nomic-embed-text` (заодно сверяет счёт токенов
+с `prompt_eval_count` Ollama):
 
 ```bash
 INDEX_MCP_OLLAMA_URL=http://localhost:11434 cargo test live_ollama -- --ignored

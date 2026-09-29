@@ -16,14 +16,17 @@
 //! раздела не терял темы. Смещения чанка при этом указывают на фрагмент
 //! документа без дописанного заголовка.
 
+use super::units::{Measure, Units};
 use super::{Chunk, Chunker, find_break, trim_range};
 use crate::docx::Document;
 use anyhow::{Result, ensure};
 use std::ops::Range;
+use std::sync::Arc;
 
 pub struct StructureChunker {
     max: usize,
     min: usize,
+    units: Arc<dyn Units>,
 }
 
 /// Узел дерева разделов: абзац-заголовок и граница его раздела.
@@ -47,18 +50,14 @@ struct Piece {
 }
 
 impl Piece {
-    fn new(start: usize, end: usize, section: String, prefix: Option<String>) -> Self {
+    fn new(m: &Measure, start: usize, end: usize, section: String, prefix: Option<String>) -> Self {
         Self {
             start,
             end,
             section,
             prefix,
-            weight: end - start,
+            weight: m.len(start, end),
         }
-    }
-
-    fn len(&self) -> usize {
-        self.end - self.start
     }
 
     /// Дописывает следующий кусок. Раздел склейки — раздел большей части:
@@ -75,24 +74,26 @@ impl Piece {
 }
 
 impl StructureChunker {
-    pub fn new(max: usize, min: usize) -> Result<Self> {
+    pub fn new(max: usize, min: usize, units: Arc<dyn Units>) -> Result<Self> {
         ensure!(
-            max >= 20,
-            "--max-section должен быть не меньше 20 символов, а не {max}"
+            max >= 8,
+            "--max-section должен быть не меньше 8 ({}), а не {max}",
+            units.name()
         );
         ensure!(
             min < max,
             "--min-section ({min}) должен быть меньше --max-section ({max})"
         );
-        Ok(Self { max, min })
+        Ok(Self { max, min, units })
     }
 
-    fn node_pieces(&self, doc: &Document, node: &Node) -> Vec<Piece> {
+    fn node_pieces(&self, doc: &Document, m: &Measure, node: &Node) -> Vec<Piece> {
         let paras = &doc.paragraphs;
         let heading = &paras[node.para];
         let span_end = paras[node.end_para - 1].end;
-        if span_end - heading.start <= self.max {
+        if m.len(heading.start, span_end) <= self.max {
             return vec![Piece::new(
+                m,
                 heading.start,
                 span_end,
                 heading.section.clone(),
@@ -100,17 +101,18 @@ impl StructureChunker {
             )];
         }
         let own_end = node.children.first().map_or(node.end_para, |c| c.para);
-        let mut pieces = self.split_paragraphs(doc, node.para..own_end, Some(&heading.text));
+        let mut pieces = self.split_paragraphs(doc, m, node.para..own_end, Some(&heading.text));
         for child in &node.children {
-            pieces.extend(self.node_pieces(doc, child));
+            pieces.extend(self.node_pieces(doc, m, child));
         }
-        self.merge(pieces)
+        self.merge(m, pieces)
     }
 
     /// Жадно набирает абзацы в куски не длиннее `max`.
     fn split_paragraphs(
         &self,
         doc: &Document,
+        m: &Measure,
         range: Range<usize>,
         heading: Option<&str>,
     ) -> Vec<Piece> {
@@ -121,16 +123,25 @@ impl StructureChunker {
         let section = first.section.clone();
         // Продолжению дописывается заголовок, поэтому бюджет куска меньше на
         // его длину: `max` — потолок всего текста чанка, который уходит в модель.
-        let heading_len = heading.map_or(0, |h| h.chars().count() + 1);
+        let heading_len = heading.map_or(0, |h| self.prefix_len(h));
         let budget = self.max.saturating_sub(heading_len).max(self.max / 2);
         let mut spans: Vec<(usize, usize)> = Vec::new();
         let mut current: Option<(usize, usize)> = None;
         for p in paras {
-            if p.end - p.start > budget {
+            if m.len(p.start, p.end) > budget {
                 // Длинный абзац продолжает набранный кусок и режется по предложениям.
                 let mut s = current.take().map_or(p.start, |(s, _)| s);
-                while p.end - s > budget {
-                    let cut = find_break(doc, s + budget / 2, s + budget).unwrap_or(s + budget);
+                while m.len(s, p.end) > budget {
+                    let hard = m.advance(s, budget);
+                    let cut = find_break(doc, m.advance(s, budget / 2), hard).unwrap_or(hard);
+                    // «Слово» длиннее бюджета режется жёстко, лишь бы кусок продвинулся.
+                    let cut = if cut > s {
+                        cut
+                    } else {
+                        (s + 1..p.end)
+                            .find(|&i| doc.chars()[i].is_whitespace())
+                            .unwrap_or(p.end)
+                    };
                     spans.push(trim_range(doc, s, cut));
                     s = trim_range(doc, cut, p.end).0;
                 }
@@ -138,7 +149,7 @@ impl StructureChunker {
                 continue;
             }
             if let Some((s, e)) = current {
-                if p.end - s <= budget {
+                if m.len(s, p.end) <= budget {
                     current = Some((s, p.end));
                     continue;
                 }
@@ -156,7 +167,7 @@ impl StructureChunker {
                 } else {
                     None
                 };
-                Piece::new(start, end, section.clone(), prefix)
+                Piece::new(m, start, end, section.clone(), prefix)
             })
             .collect()
     }
@@ -164,18 +175,17 @@ impl StructureChunker {
     /// Склеивает короткие куски одного родителя со следующими. Склейка не
     /// выходит за `max`: чанк длиннее не влезет в контекст модели эмбеддингов,
     /// поэтому короткий кусок, которому некуда приклеиться, остаётся отдельным.
-    fn merge(&self, pieces: Vec<Piece>) -> Vec<Piece> {
+    fn merge(&self, m: &Measure, pieces: Vec<Piece>) -> Vec<Piece> {
         let mut out: Vec<Piece> = Vec::with_capacity(pieces.len());
+        let short = |p: &Piece| m.len(p.start, p.end) < self.min;
         for piece in pieces {
             match out.last_mut() {
-                Some(last) if last.len() < self.min && self.fits(last, &piece) => {
-                    last.absorb(piece)
-                }
+                Some(last) if short(last) && self.fits(m, last, &piece) => last.absorb(piece),
                 _ => out.push(piece),
             }
         }
         let n = out.len();
-        if n >= 2 && out[n - 1].len() < self.min && self.fits(&out[n - 2], &out[n - 1]) {
+        if n >= 2 && short(&out[n - 1]) && self.fits(m, &out[n - 2], &out[n - 1]) {
             let tail = out.pop().expect("проверено выше");
             out.last_mut().expect("проверено выше").absorb(tail);
         }
@@ -184,9 +194,14 @@ impl StructureChunker {
 
     /// Поместится ли склейка `a` и следующего за ним `b` в `max` вместе с
     /// дописанным заголовком `a`.
-    fn fits(&self, a: &Piece, b: &Piece) -> bool {
-        let prefix = a.prefix.as_ref().map_or(0, |h| h.chars().count() + 1);
-        b.end - a.start + prefix <= self.max
+    fn fits(&self, m: &Measure, a: &Piece, b: &Piece) -> bool {
+        let prefix = a.prefix.as_ref().map_or(0, |h| self.prefix_len(h));
+        m.len(a.start, b.end) + prefix <= self.max
+    }
+
+    /// Длина дописываемого заголовка вместе с переводом строки.
+    fn prefix_len(&self, heading: &str) -> usize {
+        self.units.count(&format!("{heading}\n"))
     }
 }
 
@@ -220,18 +235,23 @@ impl Chunker for StructureChunker {
     }
 
     fn params(&self) -> serde_json::Value {
-        serde_json::json!({ "max_section": self.max, "min_section": self.min })
+        serde_json::json!({
+            "max_section": self.max,
+            "min_section": self.min,
+            "unit": self.units.name(),
+        })
     }
 
     fn chunk(&self, doc: &Document) -> Vec<Chunk> {
         let n = doc.paragraphs.len();
         let roots = build_nodes(doc, 0, n);
         let preamble_end = roots.first().map_or(n, |r| r.para);
-        let mut pieces = self.split_paragraphs(doc, 0..preamble_end, None);
+        let m = self.units.measure(doc);
+        let mut pieces = self.split_paragraphs(doc, &m, 0..preamble_end, None);
         for root in &roots {
-            pieces.extend(self.node_pieces(doc, root));
+            pieces.extend(self.node_pieces(doc, &m, root));
         }
-        self.merge(pieces)
+        self.merge(&m, pieces)
             .into_iter()
             .map(|p| {
                 let body = doc.slice(p.start, p.end);
@@ -252,6 +272,7 @@ impl Chunker for StructureChunker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::units::Chars;
     use crate::chunk::{crosses_section, doc};
 
     fn text(n: usize) -> String {
@@ -267,7 +288,9 @@ mod tests {
             ("ОС", Some(1)),
             (&body, None),
         ]);
-        let chunks = StructureChunker::new(3000, 200).unwrap().chunk(&d);
+        let chunks = StructureChunker::new(3000, 200, Arc::new(Chars))
+            .unwrap()
+            .chunk(&d);
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].text.starts_with("Сети\n"));
         assert_eq!(chunks[0].section, "Сети");
@@ -284,7 +307,9 @@ mod tests {
             ("TCP", Some(2)),
             (&body, None),
         ]);
-        let chunks = StructureChunker::new(3000, 200).unwrap().chunk(&d);
+        let chunks = StructureChunker::new(3000, 200, Arc::new(Chars))
+            .unwrap()
+            .chunk(&d);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].section, "Сети");
         assert!(!crosses_section(&d, &chunks[0]));
@@ -296,7 +321,9 @@ mod tests {
         let mut raw = vec![("Сети", Some(1))];
         raw.extend(std::iter::repeat_n((body.as_str(), None), 8));
         let d = doc(&raw);
-        let chunks = StructureChunker::new(1000, 200).unwrap().chunk(&d);
+        let chunks = StructureChunker::new(1000, 200, Arc::new(Chars))
+            .unwrap()
+            .chunk(&d);
         assert!(chunks.len() >= 3);
         for (i, c) in chunks.iter().enumerate() {
             // Потолок — весь текст чанка вместе с дописанным заголовком.
@@ -319,7 +346,9 @@ mod tests {
             ("UDP", Some(2)),
             (&body, None),
         ]);
-        let chunks = StructureChunker::new(1000, 200).unwrap().chunk(&d);
+        let chunks = StructureChunker::new(1000, 200, Arc::new(Chars))
+            .unwrap()
+            .chunk(&d);
         let sections: Vec<_> = chunks.iter().map(|c| c.section.as_str()).collect();
         assert_eq!(sections, ["Сети > TCP", "Сети > UDP"]);
         assert!(chunks[0].text.starts_with("Сети\nКратко.\nTCP\n"));
@@ -338,7 +367,9 @@ mod tests {
             ("DNS", Some(2)),
             ("Коротко.", None),
         ]);
-        let chunks = StructureChunker::new(1000, 200).unwrap().chunk(&d);
+        let chunks = StructureChunker::new(1000, 200, Arc::new(Chars))
+            .unwrap()
+            .chunk(&d);
         let sections: Vec<_> = chunks.iter().map(|c| c.section.as_str()).collect();
         assert_eq!(sections, ["Сети > TCP", "Сети > UDP"]);
         assert_eq!(chunks[1].char_end, d.char_len());
@@ -354,7 +385,9 @@ mod tests {
             ("UDP", Some(2)),
             ("Коротко.", None),
         ]);
-        let chunks = StructureChunker::new(1000, 200).unwrap().chunk(&d);
+        let chunks = StructureChunker::new(1000, 200, Arc::new(Chars))
+            .unwrap()
+            .chunk(&d);
         assert_eq!(chunks.len(), 2, "{chunks:?}");
         assert!(chunks.iter().all(|c| c.text.chars().count() <= 1000));
         assert_eq!(chunks[1].section, "Сети > UDP");
@@ -363,7 +396,9 @@ mod tests {
     #[test]
     fn oversized_paragraph_is_cut_at_sentences() {
         let d = doc(&[("Сети", Some(1)), (&text(200), None)]);
-        let chunks = StructureChunker::new(1000, 200).unwrap().chunk(&d);
+        let chunks = StructureChunker::new(1000, 200, Arc::new(Chars))
+            .unwrap()
+            .chunk(&d);
         assert!(chunks.len() >= 4);
         for c in &chunks {
             assert!(c.text.chars().count() <= 1000, "{c:?}");
@@ -375,7 +410,9 @@ mod tests {
     fn preamble_before_first_heading_has_empty_section() {
         let body = text(12);
         let d = doc(&[(&body, None), ("Сети", Some(1)), (&body, None)]);
-        let chunks = StructureChunker::new(3000, 200).unwrap().chunk(&d);
+        let chunks = StructureChunker::new(3000, 200, Arc::new(Chars))
+            .unwrap()
+            .chunk(&d);
         assert_eq!(chunks[0].section, "");
         assert_eq!(chunks[1].section, "Сети");
     }
@@ -384,7 +421,9 @@ mod tests {
     fn document_without_headings_still_chunks() {
         let body = text(12);
         let d = doc(&[(&body, None), (&body, None), (&body, None)]);
-        let chunks = StructureChunker::new(600, 200).unwrap().chunk(&d);
+        let chunks = StructureChunker::new(600, 200, Arc::new(Chars))
+            .unwrap()
+            .chunk(&d);
         assert!(chunks.len() >= 2);
         assert!(chunks.iter().all(|c| c.section.is_empty()));
     }

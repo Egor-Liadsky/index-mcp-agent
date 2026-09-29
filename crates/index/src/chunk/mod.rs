@@ -8,9 +8,12 @@
 
 mod fixed;
 mod structure;
+pub mod units;
 
 use crate::docx::{Document, SECTION_SEPARATOR};
 use anyhow::{Result, bail};
+use std::sync::Arc;
+use units::Units;
 
 pub use fixed::FixedChunker;
 pub use structure::StructureChunker;
@@ -33,13 +36,15 @@ pub trait Chunker: Send + Sync {
     fn chunk(&self, doc: &Document) -> Vec<Chunk>;
 }
 
-/// Размеры из флагов CLI; каждая стратегия берёт свои.
-#[derive(Debug, Clone, Copy)]
+/// Размеры из флагов CLI; каждая стратегия берёт свои. Все размеры — в
+/// единицах `units`.
+#[derive(Clone)]
 pub struct ChunkParams {
     pub chunk_size: usize,
     pub overlap: usize,
     pub max_section: usize,
     pub min_section: usize,
+    pub units: Arc<dyn Units>,
 }
 
 /// Имена всех стратегий в порядке вывода; `all` в CLI раскрывается в них.
@@ -47,10 +52,15 @@ pub const STRATEGIES: &[&str] = &["fixed", "structure"];
 
 pub fn make(name: &str, params: &ChunkParams) -> Result<Box<dyn Chunker>> {
     Ok(match name {
-        "fixed" => Box::new(FixedChunker::new(params.chunk_size, params.overlap)?),
+        "fixed" => Box::new(FixedChunker::new(
+            params.chunk_size,
+            params.overlap,
+            params.units.clone(),
+        )?),
         "structure" => Box::new(StructureChunker::new(
             params.max_section,
             params.min_section,
+            params.units.clone(),
         )?),
         other => bail!(
             "неизвестная стратегия {other:?}; есть: {}, all",
@@ -189,6 +199,7 @@ mod tests {
             overlap: 200,
             max_section: 3000,
             min_section: 200,
+            units: Arc::new(units::Chars),
         }
     }
 
