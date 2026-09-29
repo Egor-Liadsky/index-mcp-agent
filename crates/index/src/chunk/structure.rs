@@ -9,7 +9,8 @@
 //! иначе один такой абзац дал бы чанк, который не влезет в контекст модели.
 //!
 //! Куски короче `min_section` (часто это заголовок с одной фразой перед
-//! подразделами) склеиваются со следующим куском того же родителя, а
+//! подразделами) склеиваются со следующим куском того же родителя, если
+//! склейка не длиннее `max_section`, а
 //! последний — с предыдущим; раздел склейки — раздел её большей части. Заголовок входит в текст чанка; продолжению
 //! длинного раздела он дописывается первой строкой, чтобы кусок из середины
 //! раздела не терял темы. Смещения чанка при этом указывают на фрагмент
@@ -118,15 +119,18 @@ impl StructureChunker {
             return Vec::new();
         };
         let section = first.section.clone();
+        // Продолжению дописывается заголовок, поэтому бюджет куска меньше на
+        // его длину: `max` — потолок всего текста чанка, который уходит в модель.
+        let heading_len = heading.map_or(0, |h| h.chars().count() + 1);
+        let budget = self.max.saturating_sub(heading_len).max(self.max / 2);
         let mut spans: Vec<(usize, usize)> = Vec::new();
         let mut current: Option<(usize, usize)> = None;
         for p in paras {
-            if p.end - p.start > self.max {
+            if p.end - p.start > budget {
                 // Длинный абзац продолжает набранный кусок и режется по предложениям.
                 let mut s = current.take().map_or(p.start, |(s, _)| s);
-                while p.end - s > self.max {
-                    let cut =
-                        find_break(doc, s + self.max / 2, s + self.max).unwrap_or(s + self.max);
+                while p.end - s > budget {
+                    let cut = find_break(doc, s + budget / 2, s + budget).unwrap_or(s + budget);
                     spans.push(trim_range(doc, s, cut));
                     s = trim_range(doc, cut, p.end).0;
                 }
@@ -134,7 +138,7 @@ impl StructureChunker {
                 continue;
             }
             if let Some((s, e)) = current {
-                if p.end - s <= self.max {
+                if p.end - s <= budget {
                     current = Some((s, p.end));
                     continue;
                 }
@@ -157,20 +161,32 @@ impl StructureChunker {
             .collect()
     }
 
-    /// Склеивает короткие куски одного родителя со следующими.
+    /// Склеивает короткие куски одного родителя со следующими. Склейка не
+    /// выходит за `max`: чанк длиннее не влезет в контекст модели эмбеддингов,
+    /// поэтому короткий кусок, которому некуда приклеиться, остаётся отдельным.
     fn merge(&self, pieces: Vec<Piece>) -> Vec<Piece> {
         let mut out: Vec<Piece> = Vec::with_capacity(pieces.len());
         for piece in pieces {
             match out.last_mut() {
-                Some(last) if last.len() < self.min => last.absorb(piece),
+                Some(last) if last.len() < self.min && self.fits(last, &piece) => {
+                    last.absorb(piece)
+                }
                 _ => out.push(piece),
             }
         }
-        if out.len() >= 2 && out.last().is_some_and(|p| p.len() < self.min) {
+        let n = out.len();
+        if n >= 2 && out[n - 1].len() < self.min && self.fits(&out[n - 2], &out[n - 1]) {
             let tail = out.pop().expect("проверено выше");
             out.last_mut().expect("проверено выше").absorb(tail);
         }
         out
+    }
+
+    /// Поместится ли склейка `a` и следующего за ним `b` в `max` вместе с
+    /// дописанным заголовком `a`.
+    fn fits(&self, a: &Piece, b: &Piece) -> bool {
+        let prefix = a.prefix.as_ref().map_or(0, |h| h.chars().count() + 1);
+        b.end - a.start + prefix <= self.max
     }
 }
 
@@ -283,7 +299,8 @@ mod tests {
         let chunks = StructureChunker::new(1000, 200).unwrap().chunk(&d);
         assert!(chunks.len() >= 3);
         for (i, c) in chunks.iter().enumerate() {
-            assert!(c.char_end - c.char_start <= 1000, "{c:?}");
+            // Потолок — весь текст чанка вместе с дописанным заголовком.
+            assert!(c.text.chars().count() <= 1000, "{c:?}");
             assert!(c.text.starts_with("Сети"), "{i}: {:?}", c.text);
             assert_eq!(c.section, "Сети");
             // Кусок начинается с начала абзаца.
@@ -311,7 +328,25 @@ mod tests {
 
     #[test]
     fn short_last_piece_merges_backwards_within_parent() {
-        let body = text(43); // TCP ≈ 992 символа, раздел целиком — больше 1000
+        let body = text(22); // ≈ 505 символов: раздел «Сети» целиком больше 1000
+        let d = doc(&[
+            ("Сети", Some(1)),
+            ("TCP", Some(2)),
+            (&body, None),
+            ("UDP", Some(2)),
+            (&body, None),
+            ("DNS", Some(2)),
+            ("Коротко.", None),
+        ]);
+        let chunks = StructureChunker::new(1000, 200).unwrap().chunk(&d);
+        let sections: Vec<_> = chunks.iter().map(|c| c.section.as_str()).collect();
+        assert_eq!(sections, ["Сети > TCP", "Сети > UDP"]);
+        assert_eq!(chunks[1].char_end, d.char_len());
+    }
+
+    #[test]
+    fn merge_never_exceeds_max() {
+        let body = text(43); // TCP ≈ 992 символа
         let d = doc(&[
             ("Сети", Some(1)),
             ("TCP", Some(2)),
@@ -320,9 +355,9 @@ mod tests {
             ("Коротко.", None),
         ]);
         let chunks = StructureChunker::new(1000, 200).unwrap().chunk(&d);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].char_end, d.char_len());
-        assert!(chunks[0].char_end - chunks[0].char_start > 1000);
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert!(chunks.iter().all(|c| c.text.chars().count() <= 1000));
+        assert_eq!(chunks[1].section, "Сети > UDP");
     }
 
     #[test]
@@ -331,8 +366,7 @@ mod tests {
         let chunks = StructureChunker::new(1000, 200).unwrap().chunk(&d);
         assert!(chunks.len() >= 4);
         for c in &chunks {
-            // Короткий хвост абзаца приклеивается к предыдущему куску.
-            assert!(c.char_end - c.char_start <= 1000 + 200);
+            assert!(c.text.chars().count() <= 1000, "{c:?}");
             assert!(c.text.ends_with('.'), "{:?}", &c.text[c.text.len() - 20..]);
         }
     }

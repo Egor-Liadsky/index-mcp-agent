@@ -28,7 +28,7 @@ use std::time::Instant;
 
 use chunk::{ChunkParams, Chunker};
 use docx::Document;
-use embed::{EmbedConfig, Embedder};
+use embed::{ContextOverflow, EmbedConfig, Embedder};
 use store::{BuildInfo, ChunkRow, Store};
 
 #[derive(Debug, Parser)]
@@ -67,8 +67,9 @@ struct EmbedArgs {
     /// Текстов в одном запросе к /api/embed.
     #[arg(long, default_value_t = 32)]
     batch: usize,
-    /// Контекст модели в токенах (options.num_ctx).
-    #[arg(long, default_value_t = 8192)]
+    /// Контекст модели в токенах (options.num_ctx); больше обученного
+    /// контекста модели (2048 у nomic-embed-text) Ollama его не расширяет.
+    #[arg(long, default_value_t = 2048)]
     num_ctx: u32,
     /// Ожидаемая размерность вектора.
     #[arg(long, default_value_t = 768)]
@@ -104,8 +105,9 @@ struct BuildArgs {
     /// fixed: перекрытие соседних окон в символах.
     #[arg(long, default_value_t = 200)]
     overlap: usize,
-    /// structure: раздел длиннее режется по абзацам.
-    #[arg(long, default_value_t = 3000)]
+    /// structure: раздел длиннее режется по абзацам. Умолчание подобрано под
+    /// контекст nomic-embed-text в 2048 токенов на русском тексте.
+    #[arg(long, default_value_t = 1500)]
     max_section: usize,
     /// structure: раздел короче склеивается со следующим.
     #[arg(long, default_value_t = 200)]
@@ -261,6 +263,19 @@ async fn run_build(args: &BuildArgs) -> Result<Vec<BuildInfo>> {
         let vectors = embedder
             .embed(&args.embed.doc_prefix, &texts)
             .await
+            .map_err(|err| {
+                let hint = err.downcast_ref::<ContextOverflow>().map(|o| {
+                    format!(
+                        "чанк {} ({} символов) не помещается в контекст модели: уменьшите --max-section или --chunk-size",
+                        rows[o.index].chunk_id,
+                        rows[o.index].text.chars().count()
+                    )
+                });
+                match hint {
+                    Some(hint) => err.context(hint),
+                    None => err,
+                }
+            })
             .with_context(|| format!("эмбеддинг стратегии {}", chunker.name()))?;
         let embed_ms = started.elapsed().as_millis() as i64;
         let info = BuildInfo {
@@ -434,7 +449,7 @@ mod tests {
         assert_eq!(a.strategy, "all");
         assert_eq!(
             (a.chunk_size, a.overlap, a.max_section, a.min_section),
-            (1200, 200, 3000, 200)
+            (1200, 200, 1500, 200)
         );
         assert_eq!(a.min_chars, 50_000);
         let e = &a.embed;
@@ -442,7 +457,7 @@ mod tests {
         assert_eq!(e.model, "nomic-embed-text");
         assert_eq!(e.doc_prefix, "search_document: ");
         assert_eq!(e.query_prefix, "search_query: ");
-        assert_eq!((e.batch, e.num_ctx, e.dim), (32, 8192, 768));
+        assert_eq!((e.batch, e.num_ctx, e.dim), (32, 2048, 768));
         let c = compare_args(&[]);
         assert_eq!(c.out, PathBuf::from("docs/chunking-comparison.md"));
     }
@@ -549,6 +564,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_overflow_names_the_chunk() {
+        struct Limit;
+        impl wiremock::Respond for Limit {
+            fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t.as_str().unwrap().len() > 3000)
+                {
+                    return wiremock::ResponseTemplate::new(400).set_body_json(
+                        serde_json::json!({ "error": "the input length exceeds the context length" }),
+                    );
+                }
+                BagOfWords { dim: 768 }.respond(request)
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(path("/api/embed"))
+            .respond_with(Limit)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_corpus(tmp.path());
+        let db = tmp.path().join("index.db");
+        let url = server.uri();
+        let args = build_args(&[
+            "--input",
+            tmp.path().to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--ollama-url",
+            &url,
+            "--min-chars",
+            "0",
+            "--strategy",
+            "structure",
+            "--max-section",
+            "3000",
+        ]);
+        let err = format!("{:#}", run_build(&args).await.unwrap_err());
+        assert!(err.contains("чанк structure:"), "{err}");
+        assert!(err.contains("уменьшите --max-section"), "{err}");
+    }
+
+    #[tokio::test]
     async fn small_corpus_is_an_error_with_char_count() {
         let tmp = tempfile::tempdir().unwrap();
         write_docx(&tmp.path().join("a.docx"), "", &para("Коротко."), None);
@@ -623,7 +685,7 @@ mod tests {
             url,
             model: "nomic-embed-text".into(),
             batch: 32,
-            num_ctx: 8192,
+            num_ctx: 2048,
             dim: 768,
         })
         .unwrap();
@@ -646,8 +708,9 @@ mod tests {
             .unwrap();
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
         assert!(dot(&q[0], &docs[0]) > dot(&q[0], &docs[1]));
-        // Длинный вход в пределах num_ctx 8192 не должен давать ошибку контекста.
-        let long = "Раздел конспекта про сети. ".repeat(300);
+        // Чанк длиной в умолчание --max-section (1500 символов русского текста)
+        // помещается в контекст модели в 2048 токенов.
+        let long = "Раздел конспекта про сети. ".repeat(55);
         e.embed("search_document: ", &[long.as_str()])
             .await
             .unwrap();

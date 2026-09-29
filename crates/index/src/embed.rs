@@ -1,13 +1,14 @@
 //! Эмбеддинги через нативный API Ollama `POST {url}/api/embed`.
 //!
 //! Нативный API, а не OpenAI-совместимый `/v1/embeddings`, выбран ради
-//! двух параметров, которых у совместимого нет: `options.num_ctx` (по
-//! умолчанию Ollama даёт 2048 токенов, а раздел структурной стратегии
-//! бывает длиннее) и `truncate: false` — без него Ollama молча обрезает
-//! вход по контексту, и вектор длинного чанка описывал бы только его
-//! начало. С `truncate: false` слишком длинный вход — явная ошибка.
+//! двух параметров, которых у совместимого нет: `options.num_ctx` и
+//! `truncate: false` — без него Ollama молча обрезает вход по контексту, и
+//! вектор длинного чанка описывал бы только его начало. С `truncate: false`
+//! слишком длинный вход — явная ошибка [`ContextOverflow`] с номером входа.
+//! `num_ctx` не может превысить обученный контекст модели (2048 токенов у
+//! `nomic-embed-text`): длину чанков ограничивают стратегии, а не он.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -66,9 +67,15 @@ impl Embedder {
     /// Префикс нужен только модели: в хранилище текст пишется без него.
     pub async fn embed(&self, prefix: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(self.cfg.batch) {
+        for (batch_no, batch) in texts.chunks(self.cfg.batch).enumerate() {
             let input: Vec<String> = batch.iter().map(|t| format!("{prefix}{t}")).collect();
-            let vectors = self.request(input).await?;
+            let vectors = match self.request(input.clone()).await {
+                Err(RequestError::ContextOverflow(detail)) => {
+                    let offset = batch_no * self.cfg.batch;
+                    return Err(self.find_overflow(&input, offset, detail).await);
+                }
+                other => other?,
+            };
             ensure!(
                 vectors.len() == batch.len(),
                 "Ollama вернул {} векторов на {} входов",
@@ -89,7 +96,34 @@ impl Embedder {
         Ok(out)
     }
 
-    async fn request(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    /// Ollama отвечает на переполнение контекста одной ошибкой на весь батч.
+    /// Входы батча пересылаются по одному, чтобы назвать виновника: индекс
+    /// нужен индексатору, чтобы указать `chunk_id`, а длина — чтобы подобрать
+    /// `--max-section` или `--chunk-size`.
+    async fn find_overflow(
+        &self,
+        input: &[String],
+        offset: usize,
+        detail: String,
+    ) -> anyhow::Error {
+        for (i, text) in input.iter().enumerate() {
+            if let Err(RequestError::ContextOverflow(detail)) =
+                self.request(vec![text.clone()]).await
+            {
+                return ContextOverflow {
+                    index: offset + i,
+                    chars: text.chars().count(),
+                    model: self.cfg.model.clone(),
+                    num_ctx: self.cfg.num_ctx,
+                    detail,
+                }
+                .into();
+            }
+        }
+        anyhow::anyhow!("Ollama: {detail} (по одному входы батча помещаются)")
+    }
+
+    async fn request(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, RequestError> {
         let url = format!("{}/api/embed", self.cfg.url.trim_end_matches('/'));
         let body = EmbedRequest {
             model: &self.cfg.model,
@@ -109,13 +143,62 @@ impl Embedder {
         let status = response.status();
         let text = response.text().await.context("не прочитать ответ Ollama")?;
         if !status.is_success() {
-            bail!("Ollama ответил {status}: {}", text.trim());
+            // Текст ошибки — единственный признак: отдельного кода у Ollama нет.
+            if text.contains("exceeds the context length") {
+                return Err(RequestError::ContextOverflow(text.trim().to_string()));
+            }
+            return Err(anyhow::anyhow!("Ollama ответил {status}: {}", text.trim()).into());
         }
         let parsed: EmbedResponse = serde_json::from_str(&text)
             .with_context(|| format!("неожиданный ответ Ollama: {}", preview(&text)))?;
         Ok(parsed.embeddings)
     }
 }
+
+enum RequestError {
+    ContextOverflow(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for RequestError {
+    fn from(err: anyhow::Error) -> Self {
+        RequestError::Other(err)
+    }
+}
+
+impl From<RequestError> for anyhow::Error {
+    fn from(err: RequestError) -> Self {
+        match err {
+            RequestError::ContextOverflow(detail) => anyhow::anyhow!("Ollama: {detail}"),
+            RequestError::Other(err) => err,
+        }
+    }
+}
+
+/// Вход не помещается в контекст модели. Лежит внутри `anyhow::Error`,
+/// индексатор достаёт его `downcast_ref` и добавляет `chunk_id`.
+#[derive(Debug)]
+pub struct ContextOverflow {
+    /// Индекс входа в срезе, переданном в [`Embedder::embed`].
+    pub index: usize,
+    /// Длина входа в символах вместе с префиксом задачи.
+    pub chars: usize,
+    pub model: String,
+    pub num_ctx: u32,
+    pub detail: String,
+}
+
+impl std::fmt::Display for ContextOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "вход №{} ({} символов) не помещается в контекст модели {} (num_ctx {}): {}",
+            self.index, self.chars, self.model, self.num_ctx, self.detail
+        )
+    }
+}
+
+impl std::error::Error for ContextOverflow {}
 
 fn preview(text: &str) -> String {
     text.chars().take(200).collect()
@@ -273,6 +356,50 @@ mod tests {
         let err = e.embed("", &["а"]).await.unwrap_err().to_string();
         assert!(
             err.contains("404") && err.contains("try pulling it first"),
+            "{err}"
+        );
+    }
+
+    /// Ollama с контекстом в `limit` символов: длиннее — 400 на весь батч.
+    struct SmallContext {
+        limit: usize,
+    }
+
+    impl wiremock::Respond for SmallContext {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let inputs = body["input"].as_array().unwrap();
+            if inputs
+                .iter()
+                .any(|t| t.as_str().unwrap().chars().count() > self.limit)
+            {
+                return ResponseTemplate::new(400).set_body_json(
+                    json!({ "error": "the input length exceeds the context length" }),
+                );
+            }
+            BagOfWords { dim: 4 }.respond(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn context_overflow_names_the_input() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/embed"))
+            .respond_with(SmallContext { limit: 10 })
+            .mount(&server)
+            .await;
+        let e = Embedder::new(cfg(&server.uri(), 2, 4)).unwrap();
+        let err = e
+            .embed("p: ", &["один", "два", "три", "слишком длинный", "пять"])
+            .await
+            .unwrap_err();
+        let overflow = err
+            .downcast_ref::<ContextOverflow>()
+            .expect("типизированная ошибка");
+        assert_eq!(overflow.index, 3);
+        assert_eq!(overflow.chars, "p: слишком длинный".chars().count());
+        assert!(
+            err.to_string().contains("exceeds the context length"),
             "{err}"
         );
     }
