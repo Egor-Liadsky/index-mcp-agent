@@ -1,0 +1,655 @@
+//! `index-mcp` — локальный индекс конспектов `.docx` для поиска по смыслу.
+//!
+//! Две команды:
+//!
+//! - `build` — читает `.docx` из каталога, режет их стратегиями chunking
+//!   (трейт [`chunk::Chunker`]), получает эмбеддинги у локального Ollama и
+//!   пишет чанки с векторами в SQLite;
+//! - `compare` — сравнивает построенные стратегии по форме чанков и по
+//!   качеству поиска на вопросах из `questions.json` и пишет отчёт в
+//!   Markdown.
+//!
+//! Индексатор ниже знает только трейт `Chunker`, [`embed::Embedder`] и
+//! [`store::Store`]: новая стратегия не меняет ни его, ни эмбеддер, ни
+//! хранилище. Инструмент MCP для поиска по индексу появится отдельно;
+//! имя бинарника уже отражает, что это сервер из каталога `mcp/`.
+
+mod chunk;
+mod compare;
+mod docx;
+mod embed;
+mod store;
+
+use anyhow::{Context, Result, bail, ensure};
+use clap::{Args, Parser, Subcommand};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use chunk::{ChunkParams, Chunker};
+use docx::Document;
+use embed::{EmbedConfig, Embedder};
+use store::{BuildInfo, ChunkRow, Store};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "index-mcp",
+    version,
+    about = "Локальный индекс .docx по стратегиям chunking"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Построить индекс: .docx → чанки → эмбеддинги → SQLite.
+    Build(BuildArgs),
+    /// Сравнить стратегии по базе и вопросам, записать отчёт.
+    Compare(CompareArgs),
+}
+
+#[derive(Debug, Args)]
+struct EmbedArgs {
+    /// Адрес Ollama.
+    #[arg(long, default_value = "http://localhost:11434")]
+    ollama_url: String,
+    /// Модель эмбеддингов Ollama.
+    #[arg(long, default_value = "nomic-embed-text")]
+    model: String,
+    /// Префикс задачи перед текстом чанка (в базу не пишется).
+    #[arg(long, default_value = "search_document: ")]
+    doc_prefix: String,
+    /// Префикс задачи перед вопросом.
+    #[arg(long, default_value = "search_query: ")]
+    query_prefix: String,
+    /// Текстов в одном запросе к /api/embed.
+    #[arg(long, default_value_t = 32)]
+    batch: usize,
+    /// Контекст модели в токенах (options.num_ctx).
+    #[arg(long, default_value_t = 8192)]
+    num_ctx: u32,
+    /// Ожидаемая размерность вектора.
+    #[arg(long, default_value_t = 768)]
+    dim: usize,
+}
+
+impl EmbedArgs {
+    fn embedder(&self) -> Result<Embedder> {
+        Embedder::new(EmbedConfig {
+            url: self.ollama_url.clone(),
+            model: self.model.clone(),
+            batch: self.batch,
+            num_ctx: self.num_ctx,
+            dim: self.dim,
+        })
+    }
+}
+
+#[derive(Debug, Args)]
+struct BuildArgs {
+    /// Каталог с .docx (обходится рекурсивно).
+    #[arg(long)]
+    input: PathBuf,
+    /// Файл базы SQLite.
+    #[arg(long, default_value = "index.db")]
+    db: PathBuf,
+    /// Стратегия: fixed, structure или all.
+    #[arg(long, default_value = "all")]
+    strategy: String,
+    /// fixed: размер окна в символах.
+    #[arg(long, default_value_t = 1200)]
+    chunk_size: usize,
+    /// fixed: перекрытие соседних окон в символах.
+    #[arg(long, default_value_t = 200)]
+    overlap: usize,
+    /// structure: раздел длиннее режется по абзацам.
+    #[arg(long, default_value_t = 3000)]
+    max_section: usize,
+    /// structure: раздел короче склеивается со следующим.
+    #[arg(long, default_value_t = 200)]
+    min_section: usize,
+    /// Минимальный объём корпуса в символах.
+    #[arg(long, default_value_t = 50_000)]
+    min_chars: usize,
+    #[command(flatten)]
+    embed: EmbedArgs,
+}
+
+#[derive(Debug, Args)]
+struct CompareArgs {
+    /// Файл базы SQLite, построенной командой build.
+    #[arg(long, default_value = "index.db")]
+    db: PathBuf,
+    /// Вопросы с ожидаемыми разделами.
+    #[arg(long, default_value = "questions.json")]
+    questions: PathBuf,
+    /// Куда записать отчёт.
+    #[arg(long, default_value = "docs/chunking-comparison.md")]
+    out: PathBuf,
+    #[command(flatten)]
+    embed: EmbedArgs,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    match Cli::parse().command {
+        Command::Build(args) => {
+            for info in run_build(&args).await? {
+                println!(
+                    "{}: {} чанков из {} файлов ({} символов), эмбеддинг {} мс",
+                    info.strategy, info.chunks, info.files, info.chars, info.embed_ms
+                );
+            }
+        }
+        Command::Compare(args) => {
+            let report = run_compare(&args).await?;
+            println!("{report}");
+            println!("Отчёт записан в {}", args.out.display());
+        }
+    }
+    Ok(())
+}
+
+/// `.docx` каталога рекурсивно, в детерминированном порядке. Пропускаются
+/// скрытые каталоги и `~$*.docx` — lock-файлы открытого в Word документа.
+fn collect_docx(dir: &Path) -> Result<Vec<PathBuf>> {
+    ensure!(dir.is_dir(), "{} — не каталог", dir.display());
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current)
+            .with_context(|| format!("не прочитать {}", current.display()))?
+        {
+            let path = entry?.path();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else if name.to_lowercase().ends_with(".docx") && !name.starts_with("~$") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn read_corpus(args: &BuildArgs) -> Result<Vec<Document>> {
+    let files = collect_docx(&args.input)?;
+    ensure!(
+        !files.is_empty(),
+        "в {} нет файлов .docx",
+        args.input.display()
+    );
+    let docs = files
+        .iter()
+        .map(|f| docx::read_docx(f))
+        .collect::<Result<Vec<_>>>()?;
+    // chunk_id строится из имени файла без расширения; одинаковые имена в
+    // разных подкаталогах дали бы одинаковые id.
+    let mut stems: HashMap<String, &Path> = HashMap::new();
+    for d in &docs {
+        if let Some(other) = stems.insert(d.file_stem(), &d.source) {
+            bail!(
+                "одинаковое имя файла {:?} у {} и {}: chunk_id не будет уникальным",
+                d.file_stem(),
+                other.display(),
+                d.source.display()
+            );
+        }
+    }
+    let total: usize = docs.iter().map(Document::char_len).sum();
+    ensure!(
+        total >= args.min_chars,
+        "корпус слишком мал: {total} символов в {} файлах, нужно не меньше {}",
+        docs.len(),
+        args.min_chars
+    );
+    Ok(docs)
+}
+
+/// Чанки стратегии по всем документам с `chunk_id` и метриками границ.
+fn chunk_rows(chunker: &dyn Chunker, docs: &[Document]) -> Vec<ChunkRow> {
+    let mut rows = Vec::new();
+    for doc in docs {
+        let stem = doc.file_stem();
+        for (ordinal, c) in chunker.chunk(doc).into_iter().enumerate() {
+            rows.push(ChunkRow {
+                chunk_id: format!("{}:{stem}:{ordinal:04}", chunker.name()),
+                strategy: chunker.name().to_string(),
+                source: doc.source.display().to_string(),
+                title: doc.title.clone(),
+                crosses_section: chunk::crosses_section(doc, &c),
+                cut_mid_sentence: chunk::cut_mid_sentence(doc, &c),
+                section: c.section,
+                ordinal: ordinal as i64,
+                char_start: c.char_start as i64,
+                char_end: c.char_end as i64,
+                text: c.text,
+            });
+        }
+    }
+    rows
+}
+
+async fn run_build(args: &BuildArgs) -> Result<Vec<BuildInfo>> {
+    let params = ChunkParams {
+        chunk_size: args.chunk_size,
+        overlap: args.overlap,
+        max_section: args.max_section,
+        min_section: args.min_section,
+    };
+    // Стратегии и эмбеддер проверяют флаги до чтения корпуса и сети.
+    let chunkers = chunk::select(&args.strategy, &params)?;
+    let embedder = args.embed.embedder()?;
+    let docs = read_corpus(args)?;
+    let chars: usize = docs.iter().map(Document::char_len).sum();
+    let store = Store::open(&args.db).await?;
+    let mut infos = Vec::new();
+    for chunker in &chunkers {
+        let rows = chunk_rows(chunker.as_ref(), &docs);
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        let started = Instant::now();
+        // Эмбеддинг — до транзакции: недоступный Ollama не трогает прежний индекс.
+        let vectors = embedder
+            .embed(&args.embed.doc_prefix, &texts)
+            .await
+            .with_context(|| format!("эмбеддинг стратегии {}", chunker.name()))?;
+        let embed_ms = started.elapsed().as_millis() as i64;
+        let info = BuildInfo {
+            strategy: chunker.name().to_string(),
+            model: embedder.model().to_string(),
+            dim: embedder.dim() as i64,
+            files: docs.len() as i64,
+            chars: chars as i64,
+            chunks: rows.len() as i64,
+            embed_ms,
+            params: serde_json::json!({
+                "chunker": chunker.params(),
+                "doc_prefix": args.embed.doc_prefix,
+                "num_ctx": args.embed.num_ctx,
+            })
+            .to_string(),
+        };
+        store.replace_strategy(&info, &rows, &vectors).await?;
+        infos.push(info);
+    }
+    Ok(infos)
+}
+
+async fn run_compare(args: &CompareArgs) -> Result<String> {
+    // Без этой проверки Store::open создал бы пустую базу и отчёт был бы пустым.
+    ensure!(
+        args.db.is_file(),
+        "нет базы {}: сначала index-mcp build",
+        args.db.display()
+    );
+    let store = Store::open(&args.db).await?;
+    let builds = store.builds().await?;
+    ensure!(
+        !builds.is_empty(),
+        "в {} нет построенных стратегий",
+        args.db.display()
+    );
+    for b in &builds {
+        ensure!(
+            b.model == args.embed.model && b.dim as usize == args.embed.dim,
+            "стратегия {} построена моделью {} (dim {}), а вопросы эмбеддятся моделью {} (dim {}): векторы несравнимы",
+            b.strategy,
+            b.model,
+            b.dim,
+            args.embed.model,
+            args.embed.dim
+        );
+    }
+    let questions = compare::load_questions(&args.questions)?;
+    let embedder = args.embed.embedder()?;
+    let texts: Vec<&str> = questions.iter().map(|q| q.question.as_str()).collect();
+    let query_vectors = embedder
+        .embed(&args.embed.query_prefix, &texts)
+        .await
+        .context("эмбеддинг вопросов")?;
+    let mut evals = Vec::new();
+    for b in builds {
+        let chunks = store.load(&b.strategy).await?;
+        // builds хранит последнее построение, а модель записана и при каждом векторе:
+        // сверка по векторам ловит базу, собранную из частей разными моделями.
+        if let Some(bad) = chunks
+            .iter()
+            .find(|c| c.model != args.embed.model || c.vector.len() != args.embed.dim)
+        {
+            bail!(
+                "вектор чанка {} построен моделью {} (dim {}), а не {} (dim {})",
+                bad.row.chunk_id,
+                bad.model,
+                bad.vector.len(),
+                args.embed.model,
+                args.embed.dim
+            );
+        }
+        let strategy = b.strategy.clone();
+        evals.push(compare::evaluate(
+            &strategy,
+            &chunks,
+            Some(b),
+            &questions,
+            &query_vectors,
+        ));
+    }
+    let report = compare::render(&evals, &questions, &args.embed.model);
+    if let Some(parent) = args.out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("не создать {}", parent.display()))?;
+    }
+    std::fs::write(&args.out, &report)
+        .with_context(|| format!("не записать {}", args.out.display()))?;
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use docx::testutil::{heading, para, russian_styles, write_docx};
+    use embed::testutil::BagOfWords;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer};
+
+    fn build_args(extra: &[&str]) -> BuildArgs {
+        let mut argv = vec!["index-mcp", "build"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Build(a) => a,
+            _ => unreachable!(),
+        }
+    }
+
+    fn compare_args(extra: &[&str]) -> CompareArgs {
+        let mut argv = vec!["index-mcp", "compare"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Compare(a) => a,
+            _ => unreachable!(),
+        }
+    }
+
+    fn repeat(sentence: &str, n: usize) -> String {
+        vec![sentence; n].join(" ")
+    }
+
+    /// Два конспекта с разделами на разные темы: у поддельного эмбеддера
+    /// («мешок слов») вопросы находят свой раздел.
+    fn write_corpus(dir: &Path) {
+        let net = [
+            heading(1, "Сети"),
+            para(&repeat("Сеть связывает компьютеры каналами связи.", 3)),
+            heading(2, "TCP"),
+            para(&repeat(
+                "Протокол TCP устанавливает соединение и гарантирует доставку байтов по порядку.",
+                20,
+            )),
+            para(&repeat(
+                "Окно перегрузки TCP растёт при подтверждениях и сжимается при потерях.",
+                20,
+            )),
+            heading(2, "UDP"),
+            para(&repeat(
+                "Протокол UDP отправляет датаграммы без соединения и без подтверждений.",
+                25,
+            )),
+        ]
+        .concat();
+        write_docx(
+            &dir.join("сети.docx"),
+            &russian_styles(),
+            &net,
+            Some("Компьютерные сети"),
+        );
+        let os = [
+            heading(1, "Процессы"),
+            para(&repeat(
+                "Планировщик выбирает процесс для исполнения на процессоре по приоритету.",
+                30,
+            )),
+            heading(1, "Память"),
+            para(&repeat(
+                "Виртуальная память отображает страницы на физические кадры через таблицу страниц.",
+                30,
+            )),
+        ]
+        .concat();
+        write_docx(&dir.join("ос.docx"), &russian_styles(), &os, None);
+    }
+
+    #[test]
+    fn cli_defaults_match_spec() {
+        let a = build_args(&["--input", "notes"]);
+        assert_eq!(a.db, PathBuf::from("index.db"));
+        assert_eq!(a.strategy, "all");
+        assert_eq!(
+            (a.chunk_size, a.overlap, a.max_section, a.min_section),
+            (1200, 200, 3000, 200)
+        );
+        assert_eq!(a.min_chars, 50_000);
+        let e = &a.embed;
+        assert_eq!(e.ollama_url, "http://localhost:11434");
+        assert_eq!(e.model, "nomic-embed-text");
+        assert_eq!(e.doc_prefix, "search_document: ");
+        assert_eq!(e.query_prefix, "search_query: ");
+        assert_eq!((e.batch, e.num_ctx, e.dim), (32, 8192, 768));
+        let c = compare_args(&[]);
+        assert_eq!(c.out, PathBuf::from("docs/chunking-comparison.md"));
+    }
+
+    #[tokio::test]
+    async fn build_and_compare_end_to_end() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/embed"))
+            .respond_with(BagOfWords { dim: 768 })
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("notes");
+        std::fs::create_dir(&input).unwrap();
+        write_corpus(&input);
+        let db = tmp.path().join("index.db");
+        let (input_s, db_s, url) = (input.to_str().unwrap(), db.to_str().unwrap(), server.uri());
+        let flags = [
+            "--input",
+            input_s,
+            "--db",
+            db_s,
+            "--ollama-url",
+            &url,
+            "--min-chars",
+            "5000",
+            "--chunk-size",
+            "600",
+            "--overlap",
+            "100",
+            "--max-section",
+            "1500",
+        ];
+        let infos = run_build(&build_args(&flags)).await.unwrap();
+        assert_eq!(
+            infos
+                .iter()
+                .map(|i| i.strategy.as_str())
+                .collect::<Vec<_>>(),
+            ["fixed", "structure"]
+        );
+
+        let store = Store::open(&db).await.unwrap();
+        assert_eq!(store.orphans().await.unwrap(), 0);
+        let fixed = store.load("fixed").await.unwrap();
+        let structure = store.load("structure").await.unwrap();
+        assert!(
+            fixed.len() > structure.len(),
+            "{} vs {}",
+            fixed.len(),
+            structure.len()
+        );
+        for c in fixed.iter().chain(&structure) {
+            assert_eq!(c.model, "nomic-embed-text");
+            assert_eq!(c.vector.len(), 768);
+            // Префикс задачи уходит только в модель.
+            assert!(!c.row.text.starts_with("search_document"));
+        }
+        assert!(fixed.iter().any(|c| c.row.title == "Компьютерные сети"));
+        assert!(structure.iter().any(|c| c.row.title == "ос"));
+        assert!(structure.iter().any(|c| c.row.section == "Сети > UDP"));
+        assert!(structure.iter().all(|c| !c.row.crosses_section));
+
+        // Повторный build даёт те же chunk_id и не копит строки.
+        let ids =
+            |v: &[store::StoredChunk]| v.iter().map(|c| c.row.chunk_id.clone()).collect::<Vec<_>>();
+        run_build(&build_args(&flags)).await.unwrap();
+        assert_eq!(ids(&store.load("fixed").await.unwrap()), ids(&fixed));
+        assert_eq!(
+            ids(&store.load("structure").await.unwrap()),
+            ids(&structure)
+        );
+        assert!(ids(&structure)[0].starts_with("structure:ос:0000"));
+
+        let questions = tmp.path().join("questions.json");
+        std::fs::write(
+            &questions,
+            r#"[
+              {"question": "Как UDP отправляет датаграммы без подтверждений?", "expected_section": "Сети > UDP"},
+              {"question": "Что делает планировщик процессов?", "expected_section": "Процессы"},
+              {"question": "Как виртуальная память отображает страницы?", "expected_section": "Память"}
+            ]"#,
+        )
+        .unwrap();
+        let out = tmp.path().join("docs/report.md");
+        let report = run_compare(&compare_args(&[
+            "--db",
+            db_s,
+            "--questions",
+            questions.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--ollama-url",
+            &url,
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), report);
+        assert!(
+            report.contains("| Метрика | `fixed` | `structure` |"),
+            "{report}"
+        );
+        assert!(report.contains("| MRR | 1.000 | 1.000 |"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn small_corpus_is_an_error_with_char_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_docx(&tmp.path().join("a.docx"), "", &para("Коротко."), None);
+        let args = build_args(&["--input", tmp.path().to_str().unwrap(), "--db", "unused.db"]);
+        let err = run_build(&args).await.unwrap_err().to_string();
+        assert!(
+            err.contains("корпус слишком мал: 8 символов в 1 файлах"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_file_stems_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("b")).unwrap();
+        write_docx(&tmp.path().join("a.docx"), "", &para("x"), None);
+        write_docx(&tmp.path().join("b/a.docx"), "", &para("y"), None);
+        let args = build_args(&["--input", tmp.path().to_str().unwrap(), "--min-chars", "0"]);
+        let err = run_build(&args).await.unwrap_err().to_string();
+        assert!(err.contains("одинаковое имя файла"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn compare_refuses_other_model() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/embed"))
+            .respond_with(BagOfWords { dim: 768 })
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_corpus(tmp.path());
+        let db = tmp.path().join("index.db");
+        let (dir, db_s, url) = (
+            tmp.path().to_str().unwrap(),
+            db.to_str().unwrap(),
+            server.uri(),
+        );
+        run_build(&build_args(&[
+            "--input",
+            dir,
+            "--db",
+            db_s,
+            "--ollama-url",
+            &url,
+            "--min-chars",
+            "0",
+        ]))
+        .await
+        .unwrap();
+        let err = run_compare(&compare_args(&[
+            "--db",
+            db_s,
+            "--ollama-url",
+            &url,
+            "--model",
+            "bge-m3",
+        ]))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("построена моделью nomic-embed-text"), "{err}");
+    }
+
+    /// Живой прогон против настоящего Ollama с `nomic-embed-text`:
+    /// `INDEX_MCP_OLLAMA_URL=http://localhost:11434 cargo test live_ollama -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_ollama_embeds_with_prefixes() {
+        let url = std::env::var("INDEX_MCP_OLLAMA_URL")
+            .unwrap_or_else(|_| "http://localhost:11434".into());
+        let e = Embedder::new(EmbedConfig {
+            url,
+            model: "nomic-embed-text".into(),
+            batch: 32,
+            num_ctx: 8192,
+            dim: 768,
+        })
+        .unwrap();
+        let docs = e
+            .embed(
+                "search_document: ",
+                &[
+                    "Протокол TCP гарантирует доставку байтов по порядку.",
+                    "Рецепт борща: свёкла, капуста, картофель.",
+                ],
+            )
+            .await
+            .unwrap();
+        let q = e
+            .embed(
+                "search_query: ",
+                &["Как TCP обеспечивает надёжную доставку?"],
+            )
+            .await
+            .unwrap();
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        assert!(dot(&q[0], &docs[0]) > dot(&q[0], &docs[1]));
+        // Длинный вход в пределах num_ctx 8192 не должен давать ошибку контекста.
+        let long = "Раздел конспекта про сети. ".repeat(300);
+        e.embed("search_document: ", &[long.as_str()])
+            .await
+            .unwrap();
+    }
+}
