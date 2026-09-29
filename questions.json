@@ -1,0 +1,58 @@
+[
+  {
+    "question": "В каком порядке Android убивает процессы при нехватке памяти?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 1. Платформа Android и приложение > 1.1 Устройство платформы > 1.1.2 Процессы и приоритеты: foreground/visible/service/background/empty, low memory killer"
+  },
+  {
+    "question": "Чем onSaveInstanceState отличается от ViewModel и какой лимит у Bundle?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 2. Activity > 2.1 Жизненный цикл > 2.1.3 onSaveInstanceState/onRestoreInstanceState vs ViewModel: лимиты Bundle"
+  },
+  {
+    "question": "Как работает back stack и что делает taskAffinity?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 2. Activity > 2.2 Запуск и навигация > 2.2.2 Task и back stack, флаги Intent, taskAffinity"
+  },
+  {
+    "question": "Какие типы foreground service нужно указывать начиная с Android 14?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 5. Service и фоновая работа > 5.1 Service > 5.1.3 Foreground service: уведомление, типы FGS (Android 14+), ограничения запуска из фона (Android 12+)"
+  },
+  {
+    "question": "Что такое Doze mode и App Standby Buckets?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 5. Service и фоновая работа > 5.3 Ограничения фонового выполнения > 5.3.1 Doze mode, App Standby Buckets, background execution limits (Android 8+), exact alarms (SCHEDULE_EXACT_ALARM)"
+  },
+  {
+    "question": "Чем volatile отличается от synchronized и Atomic-классов?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 7. Классическая многопоточность > 7.1 Основы > 7.1.2 Thread, Runnable, синхронизация (synchronized, volatile, Atomic), happens-before кратко"
+  },
+  {
+    "question": "Почему отмена корутин кооперативная и как работает NonCancellable?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 8. Kotlin Coroutines > 8.3 Структурированная конкурентность > 8.3.2 Отмена: CancellationException, isActive/ensureActive/yield, try-finally, NonCancellable"
+  },
+  {
+    "question": "Чем postValue отличается от setValue в LiveData?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 9. Flow и LiveData > 9.2 LiveData > 9.2.1 LiveData vs StateFlow: lifecycle-awareness, postValue vs setValue, MediatorLiveData"
+  },
+  {
+    "question": "Какие стандартные компоненты и скоупы есть в Hilt?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 12. Dependency Injection > 12.2 Dagger 2 и Hilt > 12.2.2 Hilt: @HiltAndroidApp, @AndroidEntryPoint, @HiltViewModel, стандартные компоненты и скоупы, assisted injection"
+  },
+  {
+    "question": "Почему DataStore лучше SharedPreferences и чем apply отличается от commit?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 14. Хранение данных > 14.2 Прочие способы > 14.2.1 SharedPreferences vs DataStore (Preferences/Proto): синхронность, apply() vs commit(), почему DataStore"
+  },
+  {
+    "question": "Чем remember отличается от rememberSaveable и что такое state hoisting?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 16. Jetpack Compose > 16.1 Основы мышления > 16.1.2 State: mutableStateOf, remember vs rememberSaveable, state hoisting"
+  },
+  {
+    "question": "Какие фазы проходит кадр в Jetpack Compose?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 16. Jetpack Compose > 16.2 Побочные эффекты и жизненный цикл > 16.2.2 Фазы Compose (composition → layout → drawing), что читать в какой фазе, snapshot system кратко"
+  },
+  {
+    "question": "Как LeakCanary находит утечки памяти?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 19. Память, производительность и стабильность > 19.1 Память > 19.1.2 LeakCanary: принцип работы, типичные сценарии утечек (фрагменты, listeners, non-static inner classes)"
+  },
+  {
+    "question": "Чем lateinit отличается от by lazy и == от ===?",
+    "expected_section": "Конспект для подготовки к собеседованию: Middle Android Developer (Kotlin) > 20. Kotlin для Android-собеседования > 20.1 Ядро языка > 20.1.5 equals/hashCode, == vs ===, lazy initialization, lateinit vs by lazy"
+  }
+]
