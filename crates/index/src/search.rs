@@ -93,7 +93,7 @@ pub async fn search(
     ensure!(
         build.model == model.model,
         "стратегия {strategy} построена моделью {} (dim {}), а вопрос эмбеддится моделью {}: \
-         векторы несравнимы — запусти поиск с --model {} или пересобери индекс",
+         векторы несравнимы — задай модель {} (index-mcp serve --model, в agentcli — index_model) или пересобери индекс",
         build.model,
         build.dim,
         model.model,
