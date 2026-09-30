@@ -96,6 +96,17 @@ impl Embedder {
         Ok(out)
     }
 
+    /// Длина вектора, которую модель отдаёт на самом деле: по одному
+    /// короткому входу, без сверки с `cfg.dim`. Запасной путь, когда
+    /// `/api/show` не сообщил `embedding_length`.
+    pub async fn probe_dim(&self) -> Result<usize> {
+        let vectors = self.request(vec!["dimension probe".to_string()]).await?;
+        vectors
+            .first()
+            .map(Vec::len)
+            .context("Ollama не вернул вектор на пробный вход")
+    }
+
     /// Ollama отвечает на переполнение контекста одной ошибкой на весь батч.
     /// Входы батча пересылаются по одному, чтобы назвать виновника: индекс
     /// нужен индексатору, чтобы указать `chunk_id`, а длина — чтобы подобрать

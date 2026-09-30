@@ -18,6 +18,9 @@ mod chunk;
 mod compare;
 mod docx;
 mod embed;
+mod ollama;
+mod search;
+mod serve;
 mod store;
 mod tokens;
 
@@ -33,6 +36,24 @@ use chunk::{ChunkParams, Chunker};
 use docx::Document;
 use embed::{ContextOverflow, EmbedConfig, Embedder};
 use store::{BuildInfo, ChunkRow, Store};
+
+/// Умолчания `build` в одном месте: их берут и флаги CLI, и инструмент
+/// `index_build`, у которого не переданное значение — это умолчание команды.
+mod defaults {
+    pub const OLLAMA_URL: &str = "http://localhost:11434";
+    pub const MODEL: &str = "nomic-embed-text";
+    pub const DOC_PREFIX: &str = "search_document: ";
+    pub const QUERY_PREFIX: &str = "search_query: ";
+    pub const BATCH: usize = 32;
+    pub const NUM_CTX: u32 = 2048;
+    pub const DIM: usize = 768;
+    pub const STRATEGY: &str = "all";
+    pub const CHUNK_SIZE: usize = 1200;
+    pub const OVERLAP: usize = 200;
+    pub const MAX_SECTION: usize = 1500;
+    pub const MIN_SECTION: usize = 200;
+    pub const MIN_CHARS: usize = 50_000;
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,31 +72,33 @@ enum Command {
     Build(BuildArgs),
     /// Сравнить стратегии по базе и вопросам, записать отчёт.
     Compare(CompareArgs),
+    /// MCP-сервер на stdio: поиск по индексу, статус, модели, сборка.
+    Serve(serve::ServeArgs),
 }
 
 #[derive(Debug, Args)]
 struct EmbedArgs {
     /// Адрес Ollama.
-    #[arg(long, default_value = "http://localhost:11434")]
+    #[arg(long, default_value = defaults::OLLAMA_URL)]
     ollama_url: String,
     /// Модель эмбеддингов Ollama.
-    #[arg(long, default_value = "nomic-embed-text")]
+    #[arg(long, default_value = defaults::MODEL)]
     model: String,
     /// Префикс задачи перед текстом чанка (в базу не пишется).
-    #[arg(long, default_value = "search_document: ")]
+    #[arg(long, default_value = defaults::DOC_PREFIX)]
     doc_prefix: String,
     /// Префикс задачи перед вопросом.
-    #[arg(long, default_value = "search_query: ")]
+    #[arg(long, default_value = defaults::QUERY_PREFIX)]
     query_prefix: String,
     /// Текстов в одном запросе к /api/embed.
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = defaults::BATCH)]
     batch: usize,
     /// Контекст модели в токенах (options.num_ctx); больше обученного
     /// контекста модели (2048 у nomic-embed-text) Ollama его не расширяет.
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = defaults::NUM_CTX)]
     num_ctx: u32,
     /// Ожидаемая размерность вектора.
-    #[arg(long, default_value_t = 768)]
+    #[arg(long, default_value_t = defaults::DIM)]
     dim: usize,
 }
 
@@ -100,27 +123,27 @@ struct BuildArgs {
     #[arg(long, default_value = "index.db")]
     db: PathBuf,
     /// Стратегия: fixed, structure или all.
-    #[arg(long, default_value = "all")]
+    #[arg(long, default_value = defaults::STRATEGY)]
     strategy: String,
     /// В чём меряются размеры ниже: символы или токены модели.
     #[arg(long, value_enum, default_value_t = Unit::Chars)]
     unit: Unit,
     /// fixed: размер окна в единицах --unit.
-    #[arg(long, default_value_t = 1200)]
+    #[arg(long, default_value_t = defaults::CHUNK_SIZE)]
     chunk_size: usize,
     /// fixed: перекрытие соседних окон в единицах --unit.
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = defaults::OVERLAP)]
     overlap: usize,
     /// structure: потолок чанка в единицах --unit; раздел длиннее режется по
     /// абзацам. Умолчание в символах подобрано под контекст nomic-embed-text
     /// в 2048 токенов на русском тексте.
-    #[arg(long, default_value_t = 1500)]
+    #[arg(long, default_value_t = defaults::MAX_SECTION)]
     max_section: usize,
     /// structure: кусок короче (в единицах --unit) склеивается с соседним.
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = defaults::MIN_SECTION)]
     min_section: usize,
     /// Минимальный объём корпуса в символах.
-    #[arg(long, default_value_t = 50_000)]
+    #[arg(long, default_value_t = defaults::MIN_CHARS)]
     min_chars: usize,
     #[command(flatten)]
     embed: EmbedArgs,
@@ -165,6 +188,7 @@ async fn main() -> Result<()> {
             println!("{report}");
             println!("Отчёт записан в {}", args.out.display());
         }
+        Command::Serve(args) => serve::run(args).await?,
     }
     Ok(())
 }
@@ -291,11 +315,20 @@ async fn run_build(args: &BuildArgs) -> Result<Vec<BuildInfo>> {
     let chunkers = chunk::select(&args.strategy, &params)?;
     let docs = read_corpus(args)?;
     let chars: usize = docs.iter().map(Document::char_len).sum();
+    // Ход сборки — в stderr: stdout у `serve` занят протоколом, а у `build`
+    // там итог.
+    eprintln!("прочитано {} файлов, {chars} символов", docs.len());
     let store = Store::open(&args.db).await?;
     let mut infos = Vec::new();
     for chunker in &chunkers {
         let rows = chunk_rows(chunker.as_ref(), &docs);
         let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        eprintln!(
+            "{}: {} чанков, эмбеддинг моделью {}…",
+            chunker.name(),
+            rows.len(),
+            embedder.model()
+        );
         let started = Instant::now();
         // Эмбеддинг — до транзакции: недоступный Ollama не трогает прежний индекс.
         let vectors = embedder

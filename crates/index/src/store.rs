@@ -183,6 +183,15 @@ impl Store {
             .collect())
     }
 
+    /// Время последнего построения стратегий (`built_at`, UTC): в
+    /// [`BuildInfo`] его нет, оно нужно только статусу.
+    pub async fn build_times(&self) -> Result<std::collections::HashMap<String, String>> {
+        let rows = sqlx::query("SELECT strategy, built_at FROM builds")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
     /// Чанки стратегии с векторами в порядке файлов и `ordinal`.
     pub async fn load(&self, strategy: &str) -> Result<Vec<StoredChunk>> {
         let rows = sqlx::query(

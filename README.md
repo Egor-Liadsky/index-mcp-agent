@@ -8,10 +8,12 @@
 `docs/chunking-comparison.md`.
 
 Внешних сервисов, кроме Ollama, нет: ни Python, ни FAISS, ни облачных API.
-Ближайшие соседи ищутся перебором косинусом в Rust. MCP-инструмента поиска
-по индексу пока нет: сервер живёт в каталоге `mcp/` зонтичного репозитория
-[agent](https://github.com/Egor-Liadsky/agent), и инструмент — следующий
-шаг. С консольным клиентом `agentcli` сервер cargo-зависимостью не связан.
+Ближайшие соседи ищутся перебором косинусом в Rust. Команда `serve`
+поднимает MCP-сервер на stdio с инструментами `index_search`,
+`index_status`, `index_models`, `index_build` и `index_compare`: сервер
+живёт в каталоге `mcp/` зонтичного репозитория
+[agent](https://github.com/Egor-Liadsky/agent), и консольный клиент
+`agentcli` пользуется им как процессом (cargo-зависимости между ними нет).
 
 ## Устройство
 
@@ -19,7 +21,7 @@ Cargo workspace (Rust edition 2024) из одного крейта:
 
 | Крейт       | Каталог        | Что это                         |
 |-------------|----------------|---------------------------------|
-| `index-mcp` | `crates/index` | бинарник `index-mcp`: `build` и `compare` |
+| `index-mcp` | `crates/index` | бинарник `index-mcp`: `build`, `compare` и `serve` |
 
 - `src/main.rs` — флаги CLI, обход каталога, индексатор (чанки →
   эмбеддинги → хранилище) и команда `compare`;
@@ -30,7 +32,11 @@ Cargo workspace (Rust edition 2024) из одного крейта:
 - `src/chunk/fixed.rs`, `src/chunk/structure.rs` — две стратегии;
 - `src/embed.rs` — клиент `POST /api/embed` Ollama;
 - `src/store.rs` — SQLite через `sqlx`, миграции в `migrations/`;
-- `src/compare.rs` — метрики, hit@k, MRR и отчёт в Markdown.
+- `src/compare.rs` — метрики, hit@k, MRR и отчёт в Markdown;
+- `src/serve.rs` — MCP-сервер (`rmcp`): инструменты поверх `run_build` и
+  `run_compare`, логика chunking, эмбеддинга и хранилища не дублируется;
+- `src/search.rs` — поиск перебором косинусом со сверкой модели;
+- `src/ollama.rs` — список моделей с эмбеддингами и размерность модели.
 
 | Назначение           | Крейты                         |
 |----------------------|--------------------------------|
@@ -39,6 +45,7 @@ Cargo workspace (Rust edition 2024) из одного крейта:
 | Чтение `.docx`       | `zip`, `quick-xml`             |
 | Счёт токенов         | `unicode-normalization` (NFD)  |
 | HTTP к Ollama        | `reqwest` (rustls)             |
+| MCP-сервер           | `rmcp` (server, macros, transport-io) |
 | Индекс               | `sqlx` (SQLite, migrate)       |
 | Сериализация, ошибки | `serde`, `serde_json`, `anyhow`|
 | Тесты                | `wiremock`, `tempfile`         |
@@ -85,6 +92,38 @@ sqlite3 index.db "select strategy, count(*) from chunks group by strategy;
 | `--max-section` | `1500`       | `structure`: потолок длины чанка; раздел длиннее режется по абзацам |
 | `--min-section` | `200`        | `structure`: кусок короче склеивается со следующим |
 | `--min-chars`   | `50000`      | минимальный объём корпуса; меньше — ошибка с числом символов |
+
+### `serve`
+
+`index-mcp serve --db index.db` — MCP-сервер на stdio (JSON-RPC через
+stdin/stdout). Флаги: `--db` (умолчание `index.db`), `--strategy` (стратегия
+поиска, если `strategy` не передан), `--ollama-url`, `--model`,
+`--doc-prefix`, `--query-prefix`, `--batch`, `--num-ctx` с теми же
+умолчаниями, что у `build`. Модель `--model` — модель запроса `index_search`
+и умолчание модели `index_build`. Флага `--dim` нет: размерность берётся из
+базы (поиск) или у модели (сборка). Ход сборки печатается в stderr, stdout
+занят протоколом.
+
+Инструменты. Имена и поля JSON — общий контракт с клиентом; результат —
+JSON в `structuredContent` (тот же JSON дублируется текстом), ошибка —
+`isError` с текстом на русском.
+
+| Инструмент      | Пишет | Аргументы | Результат |
+|-----------------|-------|-----------|-----------|
+| `index_search`  | нет   | `query`; `strategy` (`fixed`/`structure`); `top_k` (5, максимум 20) | `{query, strategy, model, dim, hits:[{chunk_id, source, section, score, text}]}`, `score` — косинус |
+| `index_status`  | нет   | — | `{db, exists, search_model, strategies:[{strategy, chunks, files, chars, model, dim, embed_ms, built_at, params}]}`; базу не создаёт |
+| `index_models`  | нет   | — | `{models:[{name, dim, context_length, size}]}` — модели Ollama с capability `embedding` (`/api/tags` + `/api/show`) |
+| `index_build`   | базу  | `input` (обязателен); `strategy`, `unit` (`chars`/`tokens`), `chunk_size`, `overlap`, `max_section`, `min_section`, `min_chars`, `model`, `num_ctx`, `batch`, `dim` | `{db, model, dim, strategies:[{strategy, chunks, files, chars, embed_ms}]}` |
+| `index_compare` | отчёт | `questions`, `out` (оба обязательны) | `{out, report}` |
+
+`index_build` не переданное берёт из умолчаний `build` (таблицы выше);
+модель, адрес Ollama, `num_ctx` и `batch` — из флагов `serve`.
+
+Поиск отказывает, а не смешивает модели: если `--model` не совпала с моделью
+векторов стратегии (`builds.model`, а затем и `embeddings.model` каждого
+чанка), `index_search` возвращает ошибку «построена моделью X … векторы
+несравнимы» до обращения к Ollama. Если в базе несколько стратегий, а
+`strategy` и `--strategy` не заданы, это тоже ошибка.
 
 ### `compare`
 
@@ -259,6 +298,24 @@ MRR ожидаемо невысокие. Сравнение стратегий �
 помещаются). Нативный `/api/embed` выбран вместо OpenAI-совместимого
 `/v1/embeddings` ради `truncate` и `options`.
 
+**`serve` — новая подкоманда поверх тех же функций.** `build` и `compare`
+сохранили имена, флаги и умолчания (теперь они лежат константами в
+`main.rs::defaults`, откуда их берут и clap, и инструмент). `index_build`
+зовёт `run_build` с теми же структурами, что clap собирает из флагов, а
+`index_compare` — `run_compare`; ни chunking, ни эмбеддинг, ни хранилище не
+скопированы. Единственное добавление в `run_build` — строки хода в stderr.
+
+**Размерность новой модели.** Умолчание `--dim 768` верно только для
+`nomic-embed-text`. Инструмент `index_build` без `dim` берёт длину вектора из
+`/api/show` (`<arch>.embedding_length`), а если Ollama её не сообщил — из
+длины первого вектора (`Embedder::probe_dim`). Эмбеддер по-прежнему сверяет
+каждый вектор с этой размерностью. У CLI-флага `--dim` умолчание прежнее.
+
+**`index_compare` пишет отчёт туда, куда сказано.** У `out` нет умолчания:
+иначе вызов без аргумента перезаписал бы `docs/chunking-comparison.md`,
+который воспроизводит записанные цифры. Клиент `agentcli` этот инструмент
+модели не отдаёт.
+
 **Токенизатор внутри, а не отдельный словарь.** Счёт токенов повторяет
 WPM-токенизатор llama.cpp: NFD с удалением диакритики (`й` → `и`), нижний
 регистр, пунктуация отдельными словами, жадный поиск самых длинных токенов
@@ -295,6 +352,13 @@ cargo clippy --all-targets -- -D warnings
 сквозной тест `build` → `compare` использует поддельный эмбеддер «мешок
 слов», при котором вопросы находят свои разделы. `.docx` собираются в
 памяти, двоичных файлов в репозитории нет.
+
+Протокол `serve` проверяет `tests/protocol.rs`: настоящий процесс
+`index-mcp serve`, клиент `rmcp`, Ollama подменён `wiremock` (в том числе
+`/api/tags` и `/api/show`). Он проверяет цепочку `index_build` →
+`index_status` → `index_search` → `index_compare`, отказ поиска при другой
+модели, размерность новой модели (из `/api/show` и из первого вектора) и
+умолчания `build`.
 
 Живой тест против Ollama с `nomic-embed-text` (заодно сверяет счёт токенов
 с `prompt_eval_count` Ollama):
