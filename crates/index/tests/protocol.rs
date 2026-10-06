@@ -312,6 +312,17 @@ async fn build_status_search_compare_roundtrip() {
     .unwrap();
     assert_eq!(found["strategy"], "structure");
     assert_eq!(found["model"], "nomic-embed-text");
+    assert_eq!(
+        found["query"],
+        "Как UDP отправляет датаграммы без подтверждений?"
+    );
+    assert_eq!(found["used_query"], found["query"]);
+    assert_eq!(found["top_k"], 2);
+    assert_eq!(found["candidate_top_k"], 20);
+    assert_eq!(found["similarity_threshold"], Value::Null);
+    assert_eq!(found["rewrite"], false);
+    assert!(found["candidates"].as_u64().unwrap() >= 2);
+    assert_eq!(found["results"], 2);
     let hits = found["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0]["section"], "UDP");
@@ -324,6 +335,22 @@ async fn build_status_search_compare_roundtrip() {
     assert!(hits[0]["source"].as_str().unwrap().ends_with("сети.docx"));
     assert!(hits[0]["text"].as_str().unwrap().contains("датаграммы"));
     assert!(hits[0]["score"].as_f64().unwrap() > hits[1]["score"].as_f64().unwrap());
+
+    let fallback = call(
+        &client,
+        "index_search",
+        json!({
+            "query": "Как UDP отправляет датаграммы без подтверждений?",
+            "strategy": "structure",
+            "top_k": 1,
+            "candidate_top_k": 1,
+            "rewrite": true
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fallback["used_query"], fallback["query"]);
+    assert!(fallback["rewrite_fallback"].as_str().is_some());
 
     // Отчёт пишется туда, куда сказано, и повторяет то, что вернул инструмент.
     let dir = temp_dir("questions");

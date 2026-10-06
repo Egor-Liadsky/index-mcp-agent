@@ -100,7 +100,8 @@ stdin/stdout). Флаги: `--db` (умолчание `index.db`), `--strategy` 
 поиска, если `strategy` не передан), `--ollama-url`, `--model`,
 `--doc-prefix`, `--query-prefix`, `--batch`, `--num-ctx` с теми же
 умолчаниями, что у `build`. Модель `--model` — модель запроса `index_search`
-и умолчание модели `index_build`. Флага `--dim` нет: размерность берётся из
+и умолчание модели `index_build`; `--rewrite-model` задаёт отдельную Ollama
+модель для query rewrite. Флага `--dim` нет: размерность берётся из
 базы (поиск) или у модели (сборка). Ход сборки печатается в stderr, stdout
 занят протоколом.
 
@@ -110,14 +111,26 @@ JSON в `structuredContent` (тот же JSON дублируется текст�
 
 | Инструмент      | Пишет | Аргументы | Результат |
 |-----------------|-------|-----------|-----------|
-| `index_search`  | нет   | `query`; `strategy` (`fixed`/`structure`); `top_k` (5, максимум 20) | `{query, strategy, model, dim, hits:[{chunk_id, source, section, score, text}]}`, `score` — косинус |
+| `index_search`  | нет   | `query`; `strategy` (`fixed`/`structure`); `top_k` (5, максимум 20); `candidate_top_k` (20, максимум 100); `similarity_threshold` (-1…1, по умолчанию выключен); `rewrite` (false) | `{query, used_query, strategy, model, dim, top_k, candidate_top_k, similarity_threshold, rewrite, rewrite_fallback, candidates, results, hits:[{chunk_id, source, section, score, text}]}`, `score` — cosine |
 | `index_status`  | нет   | — | `{db, exists, search_model, strategies:[{strategy, chunks, files, chars, model, dim, embed_ms, built_at, params}]}`; базу не создаёт |
 | `index_models`  | нет   | — | `{models:[{name, dim, context_length, size}]}` — модели Ollama с capability `embedding` (`/api/tags` + `/api/show`) |
 | `index_build`   | базу  | `input` (обязателен); `strategy`, `unit` (`chars`/`tokens`), `chunk_size`, `overlap`, `max_section`, `min_section`, `min_chars`, `model`, `num_ctx`, `batch`, `dim` | `{db, model, dim, strategies:[{strategy, chunks, files, chars, embed_ms}]}` |
-| `index_compare` | отчёт | `questions`, `out` (оба обязательны) | `{out, report}` |
+| `index_compare` | отчёт | `questions`, `out` (оба обязательны); `top_k` (5); `candidate_top_k` (20); `similarity_threshold` (0.5 для filter-режимов); `rewrite_model` | `{out, report}` |
 
 `index_build` не переданное берёт из умолчаний `build` (таблицы выше);
 модель, адрес Ollama, `num_ctx` и `batch` — из флагов `serve`.
+
+Порядок поиска: исходный запрос или его rewrite эмбеддится, все чанки
+сортируются по cosine, берутся первые `candidate_top_k`, затем применяется
+`similarity_threshold`, и только после этого выдача ограничивается `top_k`.
+При ошибке `/api/chat`, пустом или невалидном ответе rewrite поиск продолжает
+работу с исходным запросом и записывает причину в `rewrite_fallback`.
+
+В самом MCP-сервере `index_search` без `similarity_threshold` не фильтрует
+выдачу. Клиент `agentcli` для RAG-ответов всегда передаёт настроенный порог,
+а если он не задан — `0.5`; клиент не позволяет модели понизить этот минимум.
+Порог `index_compare` по умолчанию также равен `0.5` в режимах `filter` и
+`rewrite+filter`.
 
 Поиск отказывает, а не смешивает модели: если `--model` не совпала с моделью
 векторов стратегии (`builds.model`, а затем и `embeddings.model` каждого
@@ -132,6 +145,10 @@ JSON в `structuredContent` (тот же JSON дублируется текст�
 | `--db`        | `index.db`                    | база, построенная `build` |
 | `--questions` | `questions.json`              | вопросы с ожидаемыми разделами |
 | `--out`       | `docs/chunking-comparison.md` | куда записать отчёт |
+| `--top-k`     | `5`                           | число результатов после фильтрации |
+| `--candidate-top-k` | `20`                      | число кандидатов до фильтрации |
+| `--similarity-threshold` | нет                  | threshold для filter-режимов; cosine от -1 до 1 |
+| `--rewrite-model` | модель эмбеддингов            | Ollama-модель query rewrite |
 
 ### Общие флаги эмбеддинга
 
@@ -147,6 +164,9 @@ JSON в `structuredContent` (тот же JSON дублируется текст�
 
 `compare` отказывается работать, если база построена другой моделью или
 размерностью, чем указаны флаги: векторы разных моделей несравнимы.
+Отчёт прогоняет один набор вопросов по режимам `baseline`, `rewrite`, `filter`
+и `rewrite+filter`, отдельно показывает hit@1, hit@k, MRR, пустые результаты,
+случаи полной фильтрации, средние размеры кандидатов/выдачи и параметры.
 
 ## Размеры в символах или токенах
 

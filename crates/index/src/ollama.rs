@@ -105,3 +105,93 @@ pub async fn embedding_models(url: &str) -> Result<Vec<EmbeddingModel>> {
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
+
+/// Переформулирует запрос через чат-модель. Ответ намеренно ограничивается
+/// первой строкой: служебные пояснения модели не должны попасть в поиск.
+pub async fn rewrite_query(url: &str, model: &str, query: &str) -> Result<String> {
+    let client = client()?;
+    let endpoint = format!("{}/api/chat", url.trim_end_matches('/'));
+    let response = client
+        .post(&endpoint)
+        .json(&json!({
+            "model": model,
+            "stream": false,
+            "options": {"temperature": 0, "num_predict": 128},
+            "messages": [
+                {"role": "system", "content": "Переформулируй запрос для семантического поиска. Верни только одну короткую поисковую формулировку без пояснений."},
+                {"role": "user", "content": query}
+            ]
+        }))
+        .send()
+        .await
+        .with_context(|| format!("Ollama недоступен по {endpoint}"))?;
+    let body = decode(response, "/api/chat").await?;
+    let raw = body["message"]["content"]
+        .as_str()
+        .or_else(|| body["response"].as_str())
+        .context("Ollama не вернул текст rewrite")?;
+    let cleaned = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .trim_matches('\x60')
+        .trim()
+        .trim_start_matches("Запрос:")
+        .trim();
+    if cleaned.is_empty() {
+        bail!("Ollama вернул пустой rewrite")
+    }
+    Ok(cleaned.chars().take(512).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn rewrite_keeps_one_clean_search_line() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"content": "Запрос:  query about UDP\nПояснение: лишнее"}
+            })))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            rewrite_query(&server.uri(), "rewrite-model", "как работает UDP")
+                .await
+                .unwrap(),
+            "query about UDP"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_errors_on_empty_or_http_failure() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"content": "  \n"}
+            })))
+            .mount(&server)
+            .await;
+        assert!(
+            rewrite_query(&server.uri(), "rewrite-model", "q")
+                .await
+                .is_err()
+        );
+
+        let failed = MockServer::start().await;
+        Mock::given(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("offline"))
+            .mount(&failed)
+            .await;
+        assert!(
+            rewrite_query(&failed.uri(), "rewrite-model", "q")
+                .await
+                .is_err()
+        );
+    }
+}

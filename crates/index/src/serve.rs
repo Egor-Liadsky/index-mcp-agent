@@ -30,10 +30,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-const DEFAULT_TOP_K: usize = 5;
-/// Больше этого `index_search` не отдаёт: чанки уходят в контекст модели.
-const MAX_TOP_K: usize = 20;
-
 /// Флаги `serve`. Размерности нет: поиск берёт её из базы, сборка — из
 /// Ollama, так что `--dim` только вводил бы в заблуждение.
 #[derive(Debug, Args, Clone)]
@@ -63,6 +59,9 @@ pub struct ServeArgs {
     /// Контекст модели в токенах.
     #[arg(long, default_value_t = defaults::NUM_CTX)]
     num_ctx: u32,
+    /// Модель для необязательной переформулировки запроса.
+    #[arg(long)]
+    rewrite_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -77,6 +76,15 @@ struct SearchArgs {
     /// How many chunks to return (default 5, at most 20).
     #[serde(default)]
     top_k: Option<usize>,
+    /// Сколько кандидатов взять до фильтрации (умолчание 20, максимум 100).
+    #[serde(default)]
+    candidate_top_k: Option<usize>,
+    /// Минимальный cosine score; отсутствие отключает фильтр.
+    #[serde(default)]
+    similarity_threshold: Option<f32>,
+    /// Переформулировать запрос через Ollama перед эмбеддингом.
+    #[serde(default)]
+    rewrite: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -135,6 +143,18 @@ struct CompareParams {
     questions: String,
     /// Where to write the Markdown report. Overwritten if it exists.
     out: String,
+    /// Сколько результатов оставить после фильтрации.
+    #[serde(default)]
+    top_k: Option<usize>,
+    /// Сколько кандидатов брать до фильтрации.
+    #[serde(default)]
+    candidate_top_k: Option<usize>,
+    /// Минимальный cosine score; отсутствие отключает фильтр.
+    #[serde(default)]
+    similarity_threshold: Option<f32>,
+    /// Модель для query rewrite; без неё используется модель сервера.
+    #[serde(default)]
+    rewrite_model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +190,7 @@ impl ServeArgs {
             prefix: self.query_prefix.clone(),
             num_ctx: self.num_ctx,
             batch: self.batch,
+            rewrite_model: self.rewrite_model.clone(),
         }
     }
 
@@ -304,6 +325,12 @@ impl IndexServer {
             questions: PathBuf::from(p.questions),
             out: PathBuf::from(p.out),
             embed: self.args.embed_args(dim),
+            top_k: p.top_k.unwrap_or(search::DEFAULT_TOP_K),
+            candidate_top_k: p.candidate_top_k.unwrap_or(search::DEFAULT_CANDIDATE_TOP_K),
+            similarity_threshold: p
+                .similarity_threshold
+                .or(Some(search::DEFAULT_COMPARE_THRESHOLD)),
+            rewrite_model: p.rewrite_model.or_else(|| self.args.rewrite_model.clone()),
         };
         let report = crate::run_compare(&args).await?;
         Ok(json!({ "out": args.out, "report": report }))
@@ -320,12 +347,17 @@ impl IndexServer {
     }
 
     #[tool(
-        description = "Semantic search over the document index: returns the chunks closest to the query. \
-Returns {query, strategy, model, dim, hits:[{chunk_id,source,section,score,text}]}. \
-Fails if the query model differs from the model the strategy was built with."
+        description = "Semantic search over the document index. Optional candidate_top_k limits candidates before \
+similarity_threshold filtering; top_k limits final hits; rewrite asks Ollama for a search formulation. Returns \
+{query,used_query,strategy,model,dim,top_k,candidate_top_k,similarity_threshold,rewrite,rewrite_fallback,candidates,results,\
+hits:[{chunk_id,source,section,score,text}]}. Fails if the query model differs from the built model."
     )]
     async fn index_search(&self, Parameters(p): Parameters<SearchArgs>) -> CallToolResult {
-        let top_k = p.top_k.unwrap_or(DEFAULT_TOP_K).clamp(1, MAX_TOP_K);
+        let options = search::SearchOptions {
+            top_k: p.top_k.unwrap_or(search::DEFAULT_TOP_K),
+            candidate_top_k: p.candidate_top_k.unwrap_or(search::DEFAULT_CANDIDATE_TOP_K),
+            similarity_threshold: p.similarity_threshold,
+        };
         let strategy = p.strategy.or_else(|| self.args.strategy.clone());
         respond(
             search::search(
@@ -333,7 +365,8 @@ Fails if the query model differs from the model the strategy was built with."
                 &self.args.query_model(),
                 &p.query,
                 strategy.as_deref(),
-                top_k,
+                options,
+                p.rewrite,
             )
             .await
             .and_then(|out| Ok(serde_json::to_value(out)?)),
@@ -370,8 +403,9 @@ the vector length comes from the model. Slow: minutes on a large corpus. Returns
     }
 
     #[tool(
-        description = "Compares the built strategies on the questions file and WRITES a Markdown report to `out`. \
-Returns {out, report}."
+        description = "Compares baseline, rewrite, filter and rewrite+filter on one questions file and WRITES a \
+Markdown report to out. Optional top_k, candidate_top_k, similarity_threshold and rewrite_model set the shared \
+comparison parameters. Returns {out, report}."
     )]
     async fn index_compare(&self, Parameters(p): Parameters<CompareParams>) -> CallToolResult {
         respond(self.compare(p).await)

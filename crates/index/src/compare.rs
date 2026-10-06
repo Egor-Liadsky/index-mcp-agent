@@ -112,6 +112,207 @@ pub struct Evaluation {
     pub unreachable: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModeParams {
+    pub rewrite: bool,
+    pub candidate_top_k: usize,
+    pub top_k: usize,
+    pub similarity_threshold: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModeEvaluation {
+    pub strategy: String,
+    pub mode: String,
+    pub params: ModeParams,
+    pub ranks: Vec<Option<usize>>,
+    pub candidates_before: Vec<usize>,
+    pub results_after: Vec<usize>,
+    pub filtered_all: usize,
+    pub rewrite_fallbacks: usize,
+}
+
+impl ModeEvaluation {
+    pub fn hit_at(&self, k: usize) -> f64 {
+        ratio(
+            self.ranks
+                .iter()
+                .filter(|r| r.is_some_and(|r| r <= k))
+                .count(),
+            self.ranks.len(),
+        )
+    }
+
+    pub fn mrr(&self) -> f64 {
+        let sum: f64 = self
+            .ranks
+            .iter()
+            .map(|rank| rank.map_or(0.0, |rank| 1.0 / rank as f64))
+            .sum();
+        if self.ranks.is_empty() {
+            0.0
+        } else {
+            sum / self.ranks.len() as f64
+        }
+    }
+
+    pub fn no_results(&self) -> usize {
+        self.ranks.iter().filter(|rank| rank.is_none()).count()
+    }
+
+    pub fn average_candidates(&self) -> f64 {
+        average(&self.candidates_before)
+    }
+
+    pub fn average_results(&self) -> f64 {
+        average(&self.results_after)
+    }
+}
+
+fn average(values: &[usize]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<usize>() as f64 / values.len() as f64
+    }
+}
+
+/// Оценивает одну комбинацию rewrite и threshold на одном наборе вопросов.
+pub fn evaluate_mode(
+    strategy: &str,
+    chunks: &[StoredChunk],
+    questions: &[Question],
+    query_vectors: &[Vec<f32>],
+    mode: &str,
+    params: ModeParams,
+    rewrite_fallbacks: usize,
+) -> ModeEvaluation {
+    let mut ranks = Vec::with_capacity(questions.len());
+    let mut candidates_before = Vec::with_capacity(questions.len());
+    let mut results_after = Vec::with_capacity(questions.len());
+    let mut filtered_all = 0;
+    for (question, query_vector) in questions.iter().zip(query_vectors) {
+        let mut scored: Vec<(f32, usize)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| (dot(query_vector, &chunk.vector), index))
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.truncate(params.candidate_top_k);
+        candidates_before.push(scored.len());
+        let mut results = scored
+            .into_iter()
+            .filter(|(score, _)| {
+                params
+                    .similarity_threshold
+                    .is_none_or(|threshold| *score >= threshold)
+            })
+            .collect::<Vec<_>>();
+        results.truncate(params.top_k);
+        if params.similarity_threshold.is_some()
+            && candidates_before.last().copied().unwrap_or_default() > 0
+            && results.is_empty()
+        {
+            filtered_all += 1;
+        }
+        results_after.push(results.len());
+        ranks.push(
+            results
+                .iter()
+                .position(|&(_, index)| question.hits(&chunks[index]))
+                .map(|rank| rank + 1),
+        );
+    }
+    ModeEvaluation {
+        strategy: strategy.to_string(),
+        mode: mode.to_string(),
+        params,
+        ranks,
+        candidates_before,
+        results_after,
+        filtered_all,
+        rewrite_fallbacks,
+    }
+}
+
+fn mode_params(e: &ModeEvaluation) -> String {
+    format!(
+        "candidate_top_k={}, top_k={}, threshold={}, rewrite={}",
+        e.params.candidate_top_k,
+        e.params.top_k,
+        e.params
+            .similarity_threshold
+            .map_or_else(|| "off".into(), |value| format!("{value:.3}")),
+        e.params.rewrite
+    )
+}
+
+/// Добавляет сравнение четырёх режимов к существующему отчёту chunking.
+pub fn render_modes(evals: &[ModeEvaluation], questions: &[Question]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "\n## Сравнение режимов RAG\n");
+    let _ = writeln!(
+        out,
+        "Один набор вопросов и один индекс; hit@k использует top_k соответствующего режима."
+    );
+    let _ = writeln!(
+        out,
+        "| Режим | Стратегия | Параметры | hit@1 | hit@k | MRR | Без результата | Фильтр удалил всех | Среднее кандидатов | Среднее результатов | Fallback rewrite |"
+    );
+    let _ = writeln!(out, "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for e in evals {
+        let n = questions.len();
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {:.3} | {:.3} | {:.3} | {} | {} | {:.2} | {:.2} | {} |",
+            e.mode,
+            e.strategy,
+            mode_params(e),
+            e.hit_at(1),
+            e.hit_at(e.params.top_k),
+            e.mrr(),
+            e.no_results(),
+            e.filtered_all,
+            e.average_candidates(),
+            e.average_results(),
+            e.rewrite_fallbacks.min(n),
+        );
+    }
+    let _ = writeln!(out, "\n### Baseline\n");
+    for name in ["baseline", "rewrite"] {
+        for e in evals.iter().filter(|e| e.mode == name) {
+            let _ = writeln!(
+                out,
+                "- {} / {}: hit@1 {:.3}, hit@k {:.3}, MRR {:.3}, без результата {}.",
+                e.mode,
+                e.strategy,
+                e.hit_at(1),
+                e.hit_at(e.params.top_k),
+                e.mrr(),
+                e.no_results()
+            );
+        }
+    }
+    let _ = writeln!(out, "\n### Improved RAG\n");
+    for name in ["filter", "rewrite+filter"] {
+        for e in evals.iter().filter(|e| e.mode == name) {
+            let _ = writeln!(
+                out,
+                "- {} / {}: hit@1 {:.3}, hit@k {:.3}, MRR {:.3}, без результата {}, среднее кандидатов {:.2}, среднее результатов {:.2}.",
+                e.mode,
+                e.strategy,
+                e.hit_at(1),
+                e.hit_at(e.params.top_k),
+                e.mrr(),
+                e.no_results(),
+                e.average_candidates(),
+                e.average_results()
+            );
+        }
+    }
+    out
+}
+
 impl Evaluation {
     pub fn hit_at(&self, k: usize) -> f64 {
         ratio(
@@ -440,6 +641,50 @@ mod tests {
                 max: 30
             }
         );
+    }
+
+    #[test]
+    fn evaluates_all_rag_modes_with_filter_metrics() {
+        let chunks = vec![
+            chunk("A", vec![1.0, 0.0], 10),
+            chunk("B", vec![0.0, 1.0], 20),
+        ];
+        let questions = vec![q("A"), q("B")];
+        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let modes = [
+            ("baseline", false, None),
+            ("rewrite", true, None),
+            ("filter", false, Some(0.9)),
+            ("rewrite+filter", true, Some(0.9)),
+        ];
+        let evaluations: Vec<_> = modes
+            .into_iter()
+            .map(|(name, rewrite, threshold)| {
+                evaluate_mode(
+                    "s",
+                    &chunks,
+                    &questions,
+                    &vectors,
+                    name,
+                    ModeParams {
+                        rewrite,
+                        candidate_top_k: 2,
+                        top_k: 1,
+                        similarity_threshold: threshold,
+                    },
+                    0,
+                )
+            })
+            .collect();
+        assert_eq!(
+            evaluations
+                .iter()
+                .map(|e| e.mode.as_str())
+                .collect::<Vec<_>>(),
+            ["baseline", "rewrite", "filter", "rewrite+filter"]
+        );
+        assert!(evaluations.iter().all(|e| e.hit_at(1) == 1.0));
+        assert!(render_modes(&evaluations, &questions).contains("Среднее кандидатов"));
     }
 
     #[test]

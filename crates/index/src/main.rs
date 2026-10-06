@@ -170,6 +170,18 @@ struct CompareArgs {
     out: PathBuf,
     #[command(flatten)]
     embed: EmbedArgs,
+    /// Сколько результатов оставить после фильтрации.
+    #[arg(long, default_value_t = search::DEFAULT_TOP_K)]
+    top_k: usize,
+    /// Сколько кандидатов брать до фильтрации.
+    #[arg(long, default_value_t = search::DEFAULT_CANDIDATE_TOP_K)]
+    candidate_top_k: usize,
+    /// Минимальный cosine score; отсутствие отключает фильтр.
+    #[arg(long)]
+    similarity_threshold: Option<f32>,
+    /// Модель для query rewrite; по умолчанию модель эмбеддингов.
+    #[arg(long)]
+    rewrite_model: Option<String>,
 }
 
 #[tokio::main]
@@ -371,6 +383,14 @@ async fn run_build(args: &BuildArgs) -> Result<Vec<BuildInfo>> {
 }
 
 async fn run_compare(args: &CompareArgs) -> Result<String> {
+    let compare_threshold = args
+        .similarity_threshold
+        .unwrap_or(search::DEFAULT_COMPARE_THRESHOLD);
+    search::validate_options(search::SearchOptions {
+        top_k: args.top_k,
+        candidate_top_k: args.candidate_top_k,
+        similarity_threshold: Some(compare_threshold),
+    })?;
     // Без этой проверки Store::open создал бы пустую базу и отчёт был бы пустым.
     ensure!(
         args.db.is_file(),
@@ -402,7 +422,26 @@ async fn run_compare(args: &CompareArgs) -> Result<String> {
         .embed(&args.embed.query_prefix, &texts)
         .await
         .context("эмбеддинг вопросов")?;
+    let rewrite_model = args.rewrite_model.as_deref().unwrap_or(&args.embed.model);
+    let mut rewritten = Vec::with_capacity(questions.len());
+    let mut rewrite_fallbacks = 0;
+    for question in &questions {
+        match ollama::rewrite_query(&args.embed.ollama_url, rewrite_model, &question.question).await
+        {
+            Ok(query) => rewritten.push(query),
+            Err(_) => {
+                rewrite_fallbacks += 1;
+                rewritten.push(question.question.clone());
+            }
+        }
+    }
+    let rewritten_texts: Vec<&str> = rewritten.iter().map(String::as_str).collect();
+    let rewritten_vectors = embedder
+        .embed(&args.embed.query_prefix, &rewritten_texts)
+        .await
+        .context("эмбеддинг rewritten вопросов")?;
     let mut evals = Vec::new();
+    let mut mode_evals = Vec::new();
     for b in builds {
         let chunks = store.load(&b.strategy).await?;
         // builds хранит последнее построение, а модель записана и при каждом векторе:
@@ -428,8 +467,68 @@ async fn run_compare(args: &CompareArgs) -> Result<String> {
             &questions,
             &query_vectors,
         ));
+        let modes = [
+            (
+                "baseline",
+                compare::ModeParams {
+                    rewrite: false,
+                    candidate_top_k: args.candidate_top_k,
+                    top_k: args.top_k,
+                    similarity_threshold: None,
+                },
+                &query_vectors,
+                0,
+            ),
+            (
+                "rewrite",
+                compare::ModeParams {
+                    rewrite: true,
+                    candidate_top_k: args.candidate_top_k,
+                    top_k: args.top_k,
+                    similarity_threshold: None,
+                },
+                &rewritten_vectors,
+                rewrite_fallbacks,
+            ),
+            (
+                "filter",
+                compare::ModeParams {
+                    rewrite: false,
+                    candidate_top_k: args.candidate_top_k,
+                    top_k: args.top_k,
+                    similarity_threshold: Some(compare_threshold),
+                },
+                &query_vectors,
+                0,
+            ),
+            (
+                "rewrite+filter",
+                compare::ModeParams {
+                    rewrite: true,
+                    candidate_top_k: args.candidate_top_k,
+                    top_k: args.top_k,
+                    similarity_threshold: Some(compare_threshold),
+                },
+                &rewritten_vectors,
+                rewrite_fallbacks,
+            ),
+        ];
+        for (name, params, vectors, fallbacks) in modes {
+            mode_evals.push(compare::evaluate_mode(
+                &strategy, &chunks, &questions, vectors, name, params, fallbacks,
+            ));
+        }
     }
-    let report = compare::render(&evals, &questions, &args.embed.model);
+    let mut report = compare::render(&evals, &questions, &args.embed.model);
+    report.push_str(&compare::render_modes(&mode_evals, &questions));
+    report.push_str(&format!(
+        "\nПараметры режимов: candidate_top_k={}, top_k={}, similarity_threshold={}, rewrite_model={}, rewrite_fallbacks={}.\n",
+        args.candidate_top_k,
+        args.top_k,
+        compare_threshold,
+        rewrite_model,
+        rewrite_fallbacks,
+    ));
     if let Some(parent) = args.out.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("не создать {}", parent.display()))?;
@@ -633,6 +732,11 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("| MRR | 1.000 | 1.000 |"), "{report}");
+        assert!(
+            report.contains("baseline") && report.contains("rewrite+filter"),
+            "{report}"
+        );
+        assert!(report.contains("Среднее кандидатов"), "{report}");
     }
 
     #[tokio::test]
