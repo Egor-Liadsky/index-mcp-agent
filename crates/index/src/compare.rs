@@ -650,21 +650,22 @@ mod tests {
             chunk("B", vec![0.0, 1.0], 20),
         ];
         let questions = vec![q("A"), q("B")];
-        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let vectors = vec![vec![0.6, 0.0], vec![0.0, 0.6]];
+        let rewritten_vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let modes = [
-            ("baseline", false, None),
-            ("rewrite", true, None),
-            ("filter", false, Some(0.9)),
-            ("rewrite+filter", true, Some(0.9)),
+            ("baseline", false, None, &vectors),
+            ("rewrite", true, None, &rewritten_vectors),
+            ("filter", false, Some(0.9), &vectors),
+            ("rewrite+filter", true, Some(0.9), &rewritten_vectors),
         ];
         let evaluations: Vec<_> = modes
             .into_iter()
-            .map(|(name, rewrite, threshold)| {
+            .map(|(name, rewrite, threshold, query_vectors)| {
                 evaluate_mode(
                     "s",
                     &chunks,
                     &questions,
-                    &vectors,
+                    query_vectors,
                     name,
                     ModeParams {
                         rewrite,
@@ -683,7 +684,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["baseline", "rewrite", "filter", "rewrite+filter"]
         );
-        assert!(evaluations.iter().all(|e| e.hit_at(1) == 1.0));
+        assert_eq!(evaluations[0].hit_at(1), 1.0);
+        assert_eq!(evaluations[1].hit_at(1), 1.0);
+        assert_eq!(evaluations[2].hit_at(1), 0.0);
+        assert_eq!(evaluations[3].hit_at(1), 1.0);
+        assert_eq!(evaluations[2].no_results(), 2);
+        assert_eq!(evaluations[2].filtered_all, 2);
+        assert_eq!(evaluations[2].average_results(), 0.0);
+        assert_eq!(evaluations[3].no_results(), 0);
         assert!(render_modes(&evaluations, &questions).contains("Среднее кандидатов"));
     }
 

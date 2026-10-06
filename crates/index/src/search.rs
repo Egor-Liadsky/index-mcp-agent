@@ -261,9 +261,9 @@ mod tests {
     }
 
     #[test]
-    fn candidates_filter_before_top_k_and_keep_ties_deterministic() {
+    fn candidate_count_filters_low_scores_and_orders_ties_stably() {
         let chunks = vec![
-            chunk("third", vec![0.8, 0.6]),
+            chunk("third", vec![0.9, 0.0]),
             chunk("first", vec![1.0, 0.0]),
             chunk("second", vec![0.9, 0.0]),
         ];
@@ -271,14 +271,15 @@ mod tests {
             chunks,
             &[1.0, 0.0],
             SearchOptions {
-                top_k: 1,
-                candidate_top_k: 2,
+                top_k: 2,
+                candidate_top_k: 3,
                 similarity_threshold: Some(0.85),
             },
         );
-        assert_eq!(candidates, 2);
+        assert_eq!(candidates, 3);
         assert_eq!(hits[0].1.chunk_id, "first");
-        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[1].1.chunk_id, "third");
+        assert_eq!(hits.len(), 2);
 
         let (_, empty) = retrieve(
             vec![chunk("low", vec![0.0, 1.0])],
