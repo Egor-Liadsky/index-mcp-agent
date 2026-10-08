@@ -69,6 +69,7 @@ pub struct SearchOptions {
     pub top_k: usize,
     pub candidate_top_k: usize,
     pub similarity_threshold: Option<f32>,
+    pub rerank: bool,
 }
 
 pub fn validate_options(options: SearchOptions) -> Result<()> {
@@ -89,26 +90,51 @@ pub fn validate_options(options: SearchOptions) -> Result<()> {
     Ok(())
 }
 
-fn retrieve(
-    chunks: Vec<crate::store::StoredChunk>,
+pub(crate) fn retrieve(
+    chunks: &[crate::store::StoredChunk],
     vector: &[f32],
+    query: &str,
     options: SearchOptions,
-) -> (usize, Vec<(f32, crate::store::ChunkRow)>) {
-    let mut scored: Vec<(f32, usize, crate::store::ChunkRow)> = chunks
-        .into_iter()
+) -> (usize, Vec<(f32, usize)>) {
+    let mut scored: Vec<(f32, usize)> = chunks
+        .iter()
         .enumerate()
-        .map(|(index, chunk)| (dot(vector, &chunk.vector), index, chunk.row))
+        .map(|(index, chunk)| (dot(vector, &chunk.vector), index))
         .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.truncate(options.candidate_top_k);
     let candidates = scored.len();
-    let mut hits = scored
-        .into_iter()
-        .filter(|(score, _, _)| options.similarity_threshold.is_none_or(|min| *score >= min))
-        .map(|(score, _, row)| (score, row))
-        .collect::<Vec<_>>();
-    hits.truncate(options.top_k);
-    (candidates, hits)
+    scored.retain(|(score, _)| options.similarity_threshold.is_none_or(|min| *score >= min));
+    if options.rerank {
+        // ponytail: точные фразы проверяем только среди cosine-кандидатов; полнотекстовый индекс нужен лишь при доказанной потере recall.
+        let phrases: Vec<String> = [('„', '“'), ('«', '»'), ('"', '"')]
+            .into_iter()
+            .flat_map(|(open, close)| {
+                query.split(open).skip(1).filter_map(move |tail| {
+                    tail.split_once(close)
+                        .map(|(phrase, _)| phrase.to_lowercase())
+                })
+            })
+            .filter(|phrase| phrase.split_whitespace().count() > 1)
+            .collect();
+        if !phrases.is_empty() {
+            scored.sort_by(|a, b| {
+                let matches = |index: usize| {
+                    let text = chunks[index].row.text.to_lowercase();
+                    phrases
+                        .iter()
+                        .filter(|phrase| text.contains(phrase.as_str()))
+                        .count()
+                };
+                matches(b.1)
+                    .cmp(&matches(a.1))
+                    .then(b.0.total_cmp(&a.0))
+                    .then(a.1.cmp(&b.1))
+            });
+        }
+    }
+    scored.truncate(options.top_k);
+    (candidates, scored)
 }
 
 pub async fn search(
@@ -207,7 +233,7 @@ pub async fn search(
         .await
         .context("эмбеддинг запроса")?
         .remove(0);
-    let (candidates, scored) = retrieve(chunks, &vector, options);
+    let (candidates, scored) = retrieve(&chunks, &vector, &used_query, options);
     let results = scored.len();
     Ok(SearchOutput {
         query: query.to_string(),
@@ -224,12 +250,12 @@ pub async fn search(
         results,
         hits: scored
             .into_iter()
-            .map(|(score, row)| Hit {
-                chunk_id: row.chunk_id,
-                source: row.source,
-                section: row.section,
+            .map(|(score, index)| Hit {
+                chunk_id: chunks[index].row.chunk_id.clone(),
+                source: chunks[index].row.source.clone(),
+                section: chunks[index].row.section.clone(),
                 score,
-                text: row.text,
+                text: chunks[index].row.text.clone(),
             })
             .collect(),
     })
@@ -261,33 +287,64 @@ mod tests {
     }
 
     #[test]
-    fn candidate_count_filters_low_scores_and_orders_ties_stably() {
-        let chunks = vec![
+    fn candidate_count_threshold_and_exact_phrase_ranking() {
+        let mut chunks = vec![
             chunk("third", vec![0.9, 0.0]),
             chunk("first", vec![1.0, 0.0]),
             chunk("second", vec![0.9, 0.0]),
         ];
         let (candidates, hits) = retrieve(
-            chunks,
+            &chunks,
             &[1.0, 0.0],
+            "без цитат",
             SearchOptions {
                 top_k: 2,
                 candidate_top_k: 3,
                 similarity_threshold: Some(0.85),
+                rerank: true,
             },
         );
         assert_eq!(candidates, 3);
-        assert_eq!(hits[0].1.chunk_id, "first");
-        assert_eq!(hits[1].1.chunk_id, "third");
+        assert_eq!(chunks[hits[0].1].row.chunk_id, "first");
+        assert_eq!(chunks[hits[1].1].row.chunk_id, "third");
         assert_eq!(hits.len(), 2);
 
-        let (_, empty) = retrieve(
-            vec![chunk("low", vec![0.0, 1.0])],
+        chunks[0].row.text = "Рекомендуемый порядок подготовки начинается здесь".into();
+        let (_, reranked) = retrieve(
+            &chunks,
             &[1.0, 0.0],
+            "Где „Рекомендуемый порядок подготовки“?",
+            SearchOptions {
+                top_k: 2,
+                candidate_top_k: 3,
+                similarity_threshold: Some(0.85),
+                rerank: true,
+            },
+        );
+        assert_eq!(chunks[reranked[0].1].row.chunk_id, "third");
+        assert_eq!(reranked[0].0, 0.9);
+        let (_, plain) = retrieve(
+            &chunks,
+            &[1.0, 0.0],
+            "Где „Рекомендуемый порядок подготовки“?",
+            SearchOptions {
+                top_k: 2,
+                candidate_top_k: 3,
+                similarity_threshold: None,
+                rerank: false,
+            },
+        );
+        assert_eq!(chunks[plain[0].1].row.chunk_id, "first");
+
+        let (_, empty) = retrieve(
+            &[chunk("low", vec![0.0, 1.0])],
+            &[1.0, 0.0],
+            "без цитат",
             SearchOptions {
                 top_k: 5,
                 candidate_top_k: 5,
                 similarity_threshold: Some(0.5),
+                rerank: true,
             },
         );
         assert!(empty.is_empty());
@@ -300,16 +357,19 @@ mod tests {
                 top_k: 0,
                 candidate_top_k: 1,
                 similarity_threshold: None,
+                rerank: true,
             },
             SearchOptions {
                 top_k: 1,
                 candidate_top_k: 0,
                 similarity_threshold: None,
+                rerank: true,
             },
             SearchOptions {
                 top_k: 1,
                 candidate_top_k: 1,
                 similarity_threshold: Some(2.0),
+                rerank: true,
             },
         ] {
             assert!(validate_options(options).is_err());

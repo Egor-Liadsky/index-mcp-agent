@@ -85,6 +85,9 @@ struct SearchArgs {
     /// Переформулировать запрос через Ollama перед эмбеддингом.
     #[serde(default)]
     rewrite: bool,
+    /// Переставлять кандидатов по точным фразам из запроса.
+    #[serde(default)]
+    rerank: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -348,7 +351,8 @@ impl IndexServer {
 
     #[tool(
         description = "Semantic search over the document index. Optional candidate_top_k limits candidates before \
-similarity_threshold filtering; top_k limits final hits; rewrite asks Ollama for a search formulation. Returns \
+similarity_threshold filtering; top_k limits final hits; rewrite asks Ollama for a search formulation; \
+rerank (default true) prioritizes exact phrases. Returns \
 {query,used_query,strategy,model,dim,top_k,candidate_top_k,similarity_threshold,rewrite,rewrite_fallback,candidates,results,\
 hits:[{chunk_id,source,section,score,text}]}. Fails if the query model differs from the built model."
     )]
@@ -357,6 +361,7 @@ hits:[{chunk_id,source,section,score,text}]}. Fails if the query model differs f
             top_k: p.top_k.unwrap_or(search::DEFAULT_TOP_K),
             candidate_top_k: p.candidate_top_k.unwrap_or(search::DEFAULT_CANDIDATE_TOP_K),
             similarity_threshold: p.similarity_threshold,
+            rerank: p.rerank.unwrap_or(true),
         };
         let strategy = p.strategy.or_else(|| self.args.strategy.clone());
         respond(

@@ -306,7 +306,7 @@ async fn build_status_search_compare_roundtrip() {
         &client,
         "index_search",
         json!({ "query": "Как UDP отправляет датаграммы без подтверждений?",
-                "strategy": "structure", "top_k": 2 }),
+                "strategy": "structure", "top_k": 2, "rerank": false }),
     )
     .await
     .unwrap();

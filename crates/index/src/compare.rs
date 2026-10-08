@@ -7,6 +7,7 @@
 //! чтобы эта часть разницы между стратегиями была видна, а не пряталась
 //! в hit@k.
 
+use crate::search::{SearchOptions, retrieve};
 use crate::store::{BuildInfo, StoredChunk};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -183,7 +184,7 @@ pub fn evaluate_mode(
     chunks: &[StoredChunk],
     questions: &[Question],
     query_vectors: &[Vec<f32>],
-    mode: &str,
+    used_queries: &[String],
     params: ModeParams,
     rewrite_fallbacks: usize,
 ) -> ModeEvaluation {
@@ -191,24 +192,21 @@ pub fn evaluate_mode(
     let mut candidates_before = Vec::with_capacity(questions.len());
     let mut results_after = Vec::with_capacity(questions.len());
     let mut filtered_all = 0;
-    for (question, query_vector) in questions.iter().zip(query_vectors) {
-        let mut scored: Vec<(f32, usize)> = chunks
-            .iter()
-            .enumerate()
-            .map(|(index, chunk)| (dot(query_vector, &chunk.vector), index))
-            .collect();
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        scored.truncate(params.candidate_top_k);
-        candidates_before.push(scored.len());
-        let mut results = scored
-            .into_iter()
-            .filter(|(score, _)| {
-                params
-                    .similarity_threshold
-                    .is_none_or(|threshold| *score >= threshold)
-            })
-            .collect::<Vec<_>>();
-        results.truncate(params.top_k);
+    for ((question, query_vector), used_query) in
+        questions.iter().zip(query_vectors).zip(used_queries)
+    {
+        let (candidates, results) = retrieve(
+            chunks,
+            query_vector,
+            used_query,
+            SearchOptions {
+                top_k: params.top_k,
+                candidate_top_k: params.candidate_top_k,
+                similarity_threshold: params.similarity_threshold,
+                rerank: true,
+            },
+        );
+        candidates_before.push(candidates);
         if params.similarity_threshold.is_some()
             && candidates_before.last().copied().unwrap_or_default() > 0
             && results.is_empty()
@@ -225,7 +223,13 @@ pub fn evaluate_mode(
     }
     ModeEvaluation {
         strategy: strategy.to_string(),
-        mode: mode.to_string(),
+        mode: match (params.rewrite, params.similarity_threshold.is_some()) {
+            (false, false) => "baseline",
+            (true, false) => "rewrite",
+            (false, true) => "filter",
+            (true, true) => "rewrite+filter",
+        }
+        .into(),
         params,
         ranks,
         candidates_before,
@@ -346,12 +350,7 @@ fn ratio(n: usize, total: usize) -> f64 {
     }
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-/// Ранжирует все чанки стратегии перебором: векторы нормализованы, поэтому
-/// косинус — скалярное произведение.
+/// Базовый режим поиска с умолчаниями `index_search`, без порога и rewrite.
 pub fn evaluate(
     strategy: &str,
     chunks: &[StoredChunk],
@@ -364,13 +363,17 @@ pub fn evaluate(
         .iter()
         .zip(query_vectors)
         .map(|(q, qv)| {
-            let mut scored: Vec<(f32, usize)> = chunks
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (dot(qv, &c.vector), i))
-                .collect();
-            // При равенстве оценок порядок — по месту в базе, чтобы прогон был воспроизводим.
-            scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            let (_, scored) = retrieve(
+                chunks,
+                qv,
+                &q.question,
+                SearchOptions {
+                    top_k: crate::search::DEFAULT_TOP_K,
+                    candidate_top_k: crate::search::DEFAULT_CANDIDATE_TOP_K,
+                    similarity_threshold: None,
+                    rerank: true,
+                },
+            );
             scored
                 .iter()
                 .position(|&(_, i)| q.hits(&chunks[i]))
@@ -653,20 +656,23 @@ mod tests {
         let vectors = vec![vec![0.6, 0.0], vec![0.0, 0.6]];
         let rewritten_vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let modes = [
-            ("baseline", false, None, &vectors),
-            ("rewrite", true, None, &rewritten_vectors),
-            ("filter", false, Some(0.9), &vectors),
-            ("rewrite+filter", true, Some(0.9), &rewritten_vectors),
+            (false, None, &vectors),
+            (true, None, &rewritten_vectors),
+            (false, Some(0.9), &vectors),
+            (true, Some(0.9), &rewritten_vectors),
         ];
         let evaluations: Vec<_> = modes
             .into_iter()
-            .map(|(name, rewrite, threshold, query_vectors)| {
+            .map(|(rewrite, threshold, query_vectors)| {
                 evaluate_mode(
                     "s",
                     &chunks,
                     &questions,
                     query_vectors,
-                    name,
+                    &questions
+                        .iter()
+                        .map(|q| q.question.clone())
+                        .collect::<Vec<_>>(),
                     ModeParams {
                         rewrite,
                         candidate_top_k: 2,
@@ -693,6 +699,37 @@ mod tests {
         assert_eq!(evaluations[2].average_results(), 0.0);
         assert_eq!(evaluations[3].no_results(), 0);
         assert!(render_modes(&evaluations, &questions).contains("Среднее кандидатов"));
+    }
+
+    #[test]
+    fn compare_uses_the_search_ranking() {
+        let mut chunks = vec![
+            chunk("A", vec![1.0, 0.0], 10),
+            chunk("B", vec![0.9, 0.0], 10),
+        ];
+        chunks[1].row.text = "Здесь точная фраза из вопроса".into();
+        let question = Question {
+            question: "Где „точная фраза“?".into(),
+            expected_section: Expected::One("B".into()),
+            source: None,
+        };
+        let queries = [question.question.clone()];
+        let evaluation = evaluate_mode(
+            "s",
+            &chunks,
+            std::slice::from_ref(&question),
+            &[vec![1.0, 0.0]],
+            &queries,
+            ModeParams {
+                rewrite: false,
+                candidate_top_k: 2,
+                top_k: 1,
+                similarity_threshold: Some(0.5),
+            },
+            0,
+        );
+        assert_eq!(evaluation.ranks, vec![Some(1)]);
+        assert_eq!(evaluation.results_after, vec![1]);
     }
 
     #[test]

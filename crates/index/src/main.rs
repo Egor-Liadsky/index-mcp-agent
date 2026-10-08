@@ -390,6 +390,7 @@ async fn run_compare(args: &CompareArgs) -> Result<String> {
         top_k: args.top_k,
         candidate_top_k: args.candidate_top_k,
         similarity_threshold: Some(compare_threshold),
+        rerank: true,
     })?;
     // Без этой проверки Store::open создал бы пустую базу и отчёт был бы пустым.
     ensure!(
@@ -467,9 +468,9 @@ async fn run_compare(args: &CompareArgs) -> Result<String> {
             &questions,
             &query_vectors,
         ));
+        let original_queries: Vec<String> = questions.iter().map(|q| q.question.clone()).collect();
         let modes = [
             (
-                "baseline",
                 compare::ModeParams {
                     rewrite: false,
                     candidate_top_k: args.candidate_top_k,
@@ -480,7 +481,6 @@ async fn run_compare(args: &CompareArgs) -> Result<String> {
                 0,
             ),
             (
-                "rewrite",
                 compare::ModeParams {
                     rewrite: true,
                     candidate_top_k: args.candidate_top_k,
@@ -491,7 +491,6 @@ async fn run_compare(args: &CompareArgs) -> Result<String> {
                 rewrite_fallbacks,
             ),
             (
-                "filter",
                 compare::ModeParams {
                     rewrite: false,
                     candidate_top_k: args.candidate_top_k,
@@ -502,7 +501,6 @@ async fn run_compare(args: &CompareArgs) -> Result<String> {
                 0,
             ),
             (
-                "rewrite+filter",
                 compare::ModeParams {
                     rewrite: true,
                     candidate_top_k: args.candidate_top_k,
@@ -513,9 +511,20 @@ async fn run_compare(args: &CompareArgs) -> Result<String> {
                 rewrite_fallbacks,
             ),
         ];
-        for (name, params, vectors, fallbacks) in modes {
+        for (params, vectors, fallbacks) in modes {
+            let used_queries = if params.rewrite {
+                &rewritten
+            } else {
+                &original_queries
+            };
             mode_evals.push(compare::evaluate_mode(
-                &strategy, &chunks, &questions, vectors, name, params, fallbacks,
+                &strategy,
+                &chunks,
+                &questions,
+                vectors,
+                used_queries,
+                params,
+                fallbacks,
             ));
         }
     }
